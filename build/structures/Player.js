@@ -756,6 +756,73 @@ class Player extends EventEmitter {
     }
 
     /**
+     * Restarts the player — rejoins the configured voice channel and resumes
+     * playback of the current track at the last known position.
+     *
+     * This is used by:
+     *   - Node-level `autoResume` (when the Lavalink WebSocket reconnects).
+     *   - The client-restart ResumeManager (after a full bot process restart).
+     *
+     * It re-sends the VOICE_STATE_UPDATE to Discord (rejoin), waits for voice
+     * credentials, then sends the current track + position + volume + paused
+     * state to the Lavalink node.
+     *
+     * @returns {Promise<this>}
+     * @emits playerResumed
+     * @since 1.0.13
+     */
+    async restart() {
+        if (!this.voiceChannel) {
+            this.riffy.emit("debug", `[Player ${this.guildId}] restart() called but no voiceChannel is set, aborting.`);
+            return this;
+        }
+
+        // 1. Re-inform the Discord gateway to rejoin the voice channel.
+        this.connect({
+            guildId: this.guildId,
+            voiceChannel: this.voiceChannel,
+            deaf: this.deaf,
+            mute: this.mute,
+        });
+
+        // 2. If we have a current encoded track, re-send it to the node at the
+        //    last known position. The queue is left untouched.
+        if (this.current && (this.current.track || this.current.encoded)) {
+            try {
+                await this.connection.resolve();
+            } catch (e) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): voice credentials not ready: ${e.message}`);
+            }
+
+            const encoded = this.current.track || this.current.encoded;
+            await this.node.rest.updatePlayer({
+                guildId: this.guildId,
+                data: {
+                    track: { encoded },
+                    position: this.position || 0,
+                    volume: this.volume,
+                    paused: this.paused,
+                },
+            });
+
+            this.riffy.emit("debug", `[Player ${this.guildId}] restart(): resumed "${this.current.info?.title || "Unknown"}" at ${this.position || 0}ms (paused=${this.paused}).`);
+            this.riffy.emit("playerResumed", this);
+        } else if (this.queue.length > 0) {
+            // No current track but queue has items — start playback.
+            this.riffy.emit("debug", `[Player ${this.guildId}] restart(): no current track, starting next from queue.`);
+            try {
+                await this.play();
+            } catch (e) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): play() failed: ${e.message}`);
+            }
+        } else {
+            this.riffy.emit("debug", `[Player ${this.guildId}] restart(): no current track and empty queue, nothing to resume.`);
+        }
+
+        return this;
+    }
+
+    /**
      * Moves the player to a new node.
      * @param {import("./Node").Node} newNode The node to move the player to.
      * @throws {TypeError} If no `newNode` is provided.
