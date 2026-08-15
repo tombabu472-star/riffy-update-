@@ -323,18 +323,28 @@ class ResumeManager {
     }
 
     /**
-     * Reconstruct a Track object from serialized data.
+     * Reconstruct a Track object from serialized data. Async because the
+     * requesterResolver may return a Promise (e.g. client.users.fetch(id)).
      * @private
      */
-    _rebuildTrack(data, node) {
+    async _rebuildTrack(data, node) {
         if (!data) return null;
         const encoded = data.encoded || null;
         let requester = data.info?.requester ?? null;
         if (requester !== null && this.requesterResolver) {
             try {
-                requester = this.requesterResolver(requester) ?? requester;
-            } catch (_) {
-                /* keep primitive requester */
+                const resolved = this.requesterResolver(requester);
+                // Support both sync and async resolvers — await a Promise,
+                // use the value directly otherwise. Fall back to the
+                // primitive requester if the resolver returns null/undefined.
+                if (resolved instanceof Promise) {
+                    requester = (await resolved) ?? requester;
+                } else {
+                    requester = resolved ?? requester;
+                }
+            } catch (e) {
+                // Resolver threw (e.g. user not found) — keep primitive requester.
+                this.riffy.emit("debug", `[ResumeManager] requesterResolver threw for guild: ${e.message}`);
             }
         }
         const track = new Track(
@@ -462,14 +472,14 @@ class ResumeManager {
                 // 3. Rebuild the queue.
                 if (Array.isArray(state.queue)) {
                     for (const t of state.queue) {
-                        const rebuilt = this._rebuildTrack(t, node);
+                        const rebuilt = await this._rebuildTrack(t, node);
                         if (rebuilt) player.queue.add(rebuilt);
                     }
                 }
 
                 // 4. Restore current track + seek to the saved position.
                 if (state.current && (state.current.encoded || (state.current.info && state.current.info.identifier))) {
-                    const currentTrack = this._rebuildTrack(state.current, node);
+                    const currentTrack = await this._rebuildTrack(state.current, node);
                     player.current = currentTrack;
                     player.position = state.position || 0;
                     player.paused = state.paused ?? false;
@@ -584,14 +594,19 @@ class ResumeManager {
 
     /**
      * Wait for voice credentials then send the track + seek position to the node.
+     *
+     * IMPORTANT: If connection.resolve() rejects (voice credentials never
+     * arrived — channel deleted, bot kicked, no Connect permission), the
+     * error is re-thrown so restorePlayer's catch block calls _failRestore.
+     * We must NOT swallow it and proceed to PATCH the track + emit
+     * playerResumed — that would treat a failed restore as successful.
+     *
      * @private
      */
     async _sendResumePayload(player, state) {
-        try {
-            await player.connection.resolve();
-        } catch (e) {
-            this.riffy.emit("debug", `[ResumeManager] Voice connection not ready for ${player.guildId}; attempting payload anyway: ${e.message}`);
-        }
+        // This throws if Discord doesn't supply voice credentials. Let it
+        // propagate so the restore is treated as a failure, not a success.
+        await player.connection.resolve();
 
         const encoded = state.current?.encoded || player.current?.track || player.current?.encoded;
         if (!encoded) {
