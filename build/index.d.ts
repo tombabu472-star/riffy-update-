@@ -246,6 +246,64 @@ export interface SerializedPlayer {
  *
  * @since 1.0.13
  */
+
+/**
+ * Abstract interface for persisting resume state. Extend this (or match the
+ * method signatures) to implement a custom storage backend (Redis, Postgres,
+ * Mongo, S3, …). All methods are async.
+ *
+ * @since 1.0.15
+ */
+export declare class StorageAdapter {
+    public init(): Promise<void>;
+    public loadAll(): Promise<Map<string, any>>;
+    public save(guildId: string, state: any): Promise<void>;
+    public remove(guildId: string): Promise<void>;
+    public clear(): Promise<void>;
+    public close(): Promise<void>;
+}
+
+/**
+ * Config object form of the `storage` option.
+ * @since 1.0.15
+ */
+export type StorageConfig =
+    | { type: "json"; filePath?: string }
+    | { type: "sharded"; dir?: string }
+    | { type: "sqlite"; path?: string };
+
+/**
+ * Persists all players in a single JSON file. Default adapter; fine for
+ * small/medium bots (<~100 players).
+ * @since 1.0.15
+ */
+export declare class JsonFileStorage extends StorageAdapter {
+    constructor(options?: { filePath?: string }, riffy?: Riffy);
+    public filePath: string;
+}
+
+/**
+ * Persists each guild's state in its own JSON file inside a directory.
+ * Recommended for medium-to-large bots (thousands of players). No write
+ * amplification, no read amplification, crash isolation per guild.
+ * @since 1.0.15
+ */
+export declare class ShardedJsonStorage extends StorageAdapter {
+    constructor(options?: { dir?: string }, riffy?: Riffy);
+    public dir: string;
+}
+
+/**
+ * Persists all players in a single SQLite database file. Recommended for
+ * large bots (tens of thousands of players). ACID, indexed. Requires the
+ * `better-sqlite3` package.
+ * @since 1.0.15
+ */
+export declare class SqliteStorage extends StorageAdapter {
+    constructor(options?: { path?: string }, riffy?: Riffy);
+    public dbPath: string;
+}
+
 export declare class ResumeManager {
     constructor(riffy: Riffy, options?: ResumeOptions & { requesterResolver?: (requester: any) => any });
 
@@ -264,6 +322,16 @@ export declare class ResumeManager {
      * @since 1.0.14
      */
     public restoreTimeout: number;
+    /**
+     * Max queue tracks to persist per guild. `null` = no limit.
+     * @since 1.0.15
+     */
+    public maxQueueSize: number | null;
+    /**
+     * The active storage adapter.
+     * @since 1.0.15
+     */
+    public storage: StorageAdapter;
 
     /**
      * Read-only snapshot of the current in-memory persisted state.
@@ -271,15 +339,17 @@ export declare class ResumeManager {
     get snapshot(): { version: number; savedAt: number; players: Record<string, SerializedPlayer> };
 
     /**
-     * Load persisted state from disk into memory.
+     * Load persisted state from the storage adapter into memory. Async.
+     * Callers may await the returned Promise, or rely on restoreAll() to
+     * await it internally.
      * @returns `true` if any players were loaded.
      */
-    public load(): boolean;
+    public load(): Promise<boolean>;
 
     /**
-     * Schedule a debounced disk write. Pass `true` to flush synchronously.
+     * Flush any pending per-guild debounced writes immediately.
      */
-    public save(immediate?: boolean): void;
+    public save(): Promise<void>;
 
     /**
      * Serialize a player into a JSON-safe object.
@@ -313,10 +383,10 @@ export declare class ResumeManager {
     public attachListeners(): void;
 
     /**
-     * Clear all persisted state — both in-memory and the on-disk file.
+     * Clear all persisted state — both in-memory and the backing store.
      * Useful for testing or a manual reset.
      */
-    public clear(): void;
+    public clear(): Promise<void>;
 }
 
 export interface PlayerOptions {
@@ -638,6 +708,29 @@ export type ResumeOptions = {
      * @since 1.0.14
      */
     restoreTimeout?: number;
+    /**
+     * Max number of queue tracks to persist per guild. A bot in a guild where
+     * someone queued a 500-track playlist would otherwise bloat storage;
+     * capping prevents that. `null` = no limit.
+     *
+     * Default: `null` (no limit).
+     *
+     * @since 1.0.15
+     */
+    maxQueueSize?: number | null;
+    /**
+     * Storage backend. Accepts:
+     *   - `"json"` — single JSON file (default; fine for <~100 players)
+     *   - `"sharded"` — one file per guild (scales to thousands of players)
+     *   - `"sqlite"` — indexed SQLite DB (tens of thousands; needs `better-sqlite3`)
+     *   - `{ type: "json"|"sharded"|"sqlite", ... }` — with adapter-specific options
+     *   - a custom `StorageAdapter` instance (Redis, Postgres, Mongo, …)
+     *
+     * If omitted, defaults to `JsonFileStorage` using `filePath` (backward compat).
+     *
+     * @since 1.0.15
+     */
+    storage?: "json" | "sharded" | "sqlite" | StorageConfig | StorageAdapter;
 };
 
 /**

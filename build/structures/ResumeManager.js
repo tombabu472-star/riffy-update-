@@ -1,14 +1,18 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { Track } = require("./Track");
+const { StorageAdapter } = require("./storage/StorageAdapter");
+const { JsonFileStorage } = require("./storage/JsonFileStorage");
+const { ShardedJsonStorage } = require("./storage/ShardedJsonStorage");
+const { SqliteStorage } = require("./storage/SqliteStorage");
 
 /**
  * ResumeManager
  *
  * Provides client-restart auto-resume for Riffy. Persists player state
  * (voice channel, text channel, current track, playback position, volume,
- * loop mode, paused state, and the full queue) to a JSON file on disk and
- * restores all players after the bot process restarts.
+ * loop mode, paused state, and the full queue) to a pluggable storage
+ * adapter and restores all players after the bot process restarts.
  *
  * On restore it will:
  *   1. Re-create the player connection (rejoin the same voice channel).
@@ -19,15 +23,32 @@ const { Track } = require("./Track");
  * This is distinct from Node-level `autoResume` (which only re-establishes
  * players when the Lavalink WebSocket reconnects). ResumeManager survives a
  * full process restart.
+ *
+ * ## Scaling
+ *
+ * The storage backend is swappable via `options.storage`. Built-in adapters:
+ *   - `"json"` / `{ type: "json", filePath }` — single file (default; <~100 players)
+ *   - `"sharded"` / `{ type: "sharded", dir }` — one file per guild (thousands)
+ *   - `"sqlite"` / `{ type: "sqlite", path }` — indexed DB (tens of thousands)
+ *   - or pass any custom `StorageAdapter` instance (Redis, Postgres, Mongo…)
+ *
+ * If omitted, defaults to `JsonFileStorage` using `filePath` (backward compat).
+ *
+ * Per-guild writes are debounced independently — a busy guild never blocks
+ * writes for other guilds.
  */
 class ResumeManager {
     /**
      * @param {import("./Riffy").Riffy} riffy
      * @param {Object} [options]
      * @param {boolean} [options.enabled=false] Enable client-restart resume.
-     * @param {string} [options.filePath] Path to the state JSON file. Defaults to `<cwd>/riffy-state.json`.
-     * @param {number} [options.saveInterval=3000] Debounce window (ms) for disk writes.
+     * @param {string} [options.filePath] Path to the JSON file (JsonFileStorage) or directory (ShardedJsonStorage).
+     * @param {number} [options.saveInterval=3000] Debounce window (ms) for per-guild disk writes.
      * @param {(requester: any) => any} [options.requesterResolver] Optional function to rebuild a requester object from the persisted value.
+     * @param {boolean} [options.clearOnRestore=false] Delete persisted state after a successful full restore.
+     * @param {number} [options.restoreTimeout=15000] Max ms to wait for voice credentials per player before aborting.
+     * @param {number|null} [options.maxQueueSize=null] Cap how many queue tracks to persist per guild (prevents a single huge playlist from bloating storage). `null` = no limit.
+     * @param {string|object|StorageAdapter} [options.storage] Storage adapter: preset string ("json"|"sharded"|"sqlite"), a config object ({type, ...}), or a custom adapter instance.
      */
     constructor(riffy, options = {}) {
         this.riffy = riffy;
@@ -35,91 +56,99 @@ class ResumeManager {
         this.filePath = options.filePath || path.join(process.cwd(), "riffy-state.json");
         this.saveInterval = typeof options.saveInterval === "number" ? options.saveInterval : 3000;
         this.requesterResolver = typeof options.requesterResolver === "function" ? options.requesterResolver : null;
-        /**
-         * When `true`, the persisted state file is deleted from disk once a
-         * full restore completes successfully. This prevents stale state from
-         * accumulating and being re-applied on every subsequent restart.
-         *
-         * The in-memory state is also wiped, so a second restoreAll() call
-         * becomes a no-op (returns `[]`). New player activity after the
-         * restore will be persisted fresh as usual.
-         *
-         * Default: `false` (state is kept across restarts).
-         */
         this.clearOnRestore = options.clearOnRestore ?? false;
-        /**
-         * Maximum time (ms) to wait for voice credentials when restoring a
-         * single player. If Discord doesn't reply with a VOICE_SERVER_UPDATE
-         * in time (e.g. the voice channel was deleted, the bot was kicked,
-         * or it lacks Connect permission), the restore for that guild is
-         * aborted, the half-created player is destroyed, the guild is
-         * removed from persisted state, and a `playerRestoreFailed` event
-         * is emitted with reason `"timeout"`.
-         *
-         * Default: `15000` (15 seconds).
-         */
         this.restoreTimeout = typeof options.restoreTimeout === "number" ? options.restoreTimeout : 15000;
+        /**
+         * Max number of queue tracks to persist per guild. A bot in a guild
+         * where someone queued a 500-track playlist would otherwise bloat
+         * storage; capping prevents that. `null` = no limit.
+         * Default: `null` (no limit).
+         * @since 1.0.15
+         */
+        this.maxQueueSize = options.maxQueueSize ?? null;
 
         /** @type {{ version: number, savedAt: number, players: Record<string, any> }} */
         this._state = { version: 1, savedAt: 0, players: {} };
-        this._saveTimer = null;
-        this._dirty = false;
         this._restored = false;
         this._restoredFully = false;
         this._listenersAttached = false;
         /** @type {Map<string, (reason: string, detail?: any) => void>} guildId -> reject fn for active restores */
         this._pendingRestores = new Map();
+        /** @type {Map<string, NodeJS.Timeout>} guildId -> per-guild debounce timer */
+        this._saveTimers = new Map();
+        /** @type {Promise<Map<string, any>> | null} */
+        this._loadPromise = null;
+
+        /** @type {StorageAdapter} */
+        this.storage = this._resolveStorage(options);
     }
 
     /**
-     * Load persisted state from disk into memory. Corrupt or partial writes
-     * (e.g. from a crash mid-flush or storage loss) are handled gracefully:
-     * if the file can't be parsed, or individual player entries are missing
-     * required fields, those entries are dropped and logged rather than
-     * crashing the restore.
-     * @returns {boolean} Whether any valid players were loaded.
+     * Resolve the storage adapter from the `storage` option, falling back to
+     * JsonFileStorage for backward compatibility.
+     * @private
+     */
+    _resolveStorage(options) {
+        const s = options.storage;
+        // 1. Custom adapter instance — use as-is.
+        if (s && typeof s === "object" && typeof s.save === "function" && typeof s.loadAll === "function") {
+            return s;
+        }
+        // 2. Config object: { type: "json"|"sharded"|"sqlite", ... }
+        if (s && typeof s === "object" && typeof s.type === "string") {
+            if (s.type === "json") return new JsonFileStorage({ filePath: s.filePath || options.filePath }, this.riffy);
+            if (s.type === "sharded") return new ShardedJsonStorage({ dir: s.dir || options.filePath || path.join(process.cwd(), "riffy-state") }, this.riffy);
+            if (s.type === "sqlite") return new SqliteStorage({ path: s.path || options.filePath || "riffy-state.db" }, this.riffy);
+            throw new Error(`Unknown storage type: ${s.type}. Use "json", "sharded", "sqlite", or pass a custom StorageAdapter.`);
+        }
+        // 3. Preset string: "json" | "sharded" | "sqlite"
+        if (typeof s === "string") {
+            if (s === "json") return new JsonFileStorage({ filePath: options.filePath }, this.riffy);
+            if (s === "sharded") return new ShardedJsonStorage({ dir: options.filePath || path.join(process.cwd(), "riffy-state") }, this.riffy);
+            if (s === "sqlite") return new SqliteStorage({ path: options.filePath || "riffy-state.db" }, this.riffy);
+            throw new Error(`Unknown storage preset: ${s}. Use "json", "sharded", or "sqlite".`);
+        }
+        // 4. Default (backward compat): single JSON file via filePath.
+        return new JsonFileStorage({ filePath: options.filePath }, this.riffy);
+    }
+
+    /**
+     * Load persisted state from the storage adapter into memory. Async (the
+     * adapter may do real I/O). Returns a Promise that resolves to the loaded
+     * Map; callers that don't await can rely on restoreAll() to await it.
+     *
+     * Corrupt entries are dropped + logged by the adapter rather than crashing
+     * the restore. Validation is also applied here as a second line of defense.
+     *
+     * @returns {Promise<boolean>} Whether any valid players were loaded.
      */
     load() {
-        if (!this.enabled) return false;
-        try {
-            if (!fs.existsSync(this.filePath)) return false;
-            const raw = fs.readFileSync(this.filePath, "utf-8");
-            const parsed = JSON.parse(raw);
-            if (!parsed || typeof parsed !== "object" || !parsed.players) return false;
-
+        if (!this.enabled) return Promise.resolve(false);
+        this._loadPromise = (async () => {
+            await this.storage.init();
+            const loaded = await this.storage.loadAll();
             const validPlayers = {};
             let dropped = 0;
-            for (const [guildId, state] of Object.entries(parsed.players)) {
+            for (const [guildId, state] of loaded.entries()) {
                 const validation = this._validatePlayerState(guildId, state);
                 if (validation.ok) {
                     validPlayers[guildId] = state;
                 } else {
                     dropped++;
                     this.riffy.emit("debug", `[ResumeManager] Dropped invalid persisted entry for guild ${guildId}: ${validation.reason}`);
+                    // Remove the bad entry from the store so it isn't retried.
+                    this.storage.remove(guildId).catch(() => {});
                 }
             }
-
-            this._state = { version: 1, savedAt: parsed.savedAt || 0, players: validPlayers };
+            this._state = { version: 1, savedAt: Date.now(), players: validPlayers };
             const count = Object.keys(validPlayers).length;
-            this.riffy.emit("debug", `[ResumeManager] Loaded state for ${count} player(s) from ${this.filePath}${dropped ? ` (dropped ${dropped} invalid entry/entries)` : ""}`);
-
-            // If we dropped invalid entries, persist the cleaned-up state.
-            if (dropped > 0) this.save(true);
+            this.riffy.emit("debug", `[ResumeManager] Loaded state for ${count} player(s) via ${this.storage.constructor.name}${dropped ? ` (dropped ${dropped} invalid entry/entries)` : ""}`);
             return count > 0;
-        } catch (e) {
-            this.riffy.emit("debug", `[ResumeManager] Failed to load state from ${this.filePath} (likely corrupt or partial write): ${e.message}`);
-            // Move the corrupt file aside so future saves aren't blocked by it.
-            try {
-                if (fs.existsSync(this.filePath)) {
-                    const backup = this.filePath + ".corrupt-" + Date.now();
-                    fs.renameSync(this.filePath, backup);
-                    this.riffy.emit("debug", `[ResumeManager] Moved corrupt state file to ${backup}`);
-                }
-            } catch (_) {
-                /* ignore */
-            }
+        })().catch((e) => {
+            this.riffy.emit("debug", `[ResumeManager] load() failed: ${e.message}`);
             return false;
-        }
+        });
+        return this._loadPromise;
     }
 
     /**
@@ -142,35 +171,20 @@ class ResumeManager {
     }
 
     /**
-     * Schedule a debounced write to disk.
-     * @param {boolean} [immediate=false] If true, flush synchronously right now.
+     * Flush any pending per-guild debounced writes immediately. Returns a
+     * Promise that resolves when all pending saves have settled.
+     * @returns {Promise<void>}
      */
-    save(immediate = false) {
+    async save() {
         if (!this.enabled) return;
-        this._dirty = true;
-        if (immediate) {
-            this._flush();
-            return;
-        }
-        if (this._saveTimer) return;
-        this._saveTimer = setTimeout(() => {
-            this._saveTimer = null;
-            this._flush();
-        }, this.saveInterval);
-    }
-
-    /** @private */
-    _flush() {
-        if (!this._dirty) return;
-        this._dirty = false;
-        try {
-            this._state.savedAt = Date.now();
-            const dir = path.dirname(this.filePath);
-            if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-            fs.writeFileSync(this.filePath, JSON.stringify(this._state, null, 2), "utf-8");
-        } catch (e) {
-            this.riffy.emit("debug", `[ResumeManager] Failed to save state to ${this.filePath}: ${e.message}`);
-        }
+        const guildIds = [...this._saveTimers.keys()];
+        await Promise.allSettled(guildIds.map((guildId) => {
+            const timer = this._saveTimers.get(guildId);
+            if (timer) { clearTimeout(timer); this._saveTimers.delete(guildId); }
+            const state = this._state.players[guildId];
+            if (state) return this.storage.save(guildId, state);
+            return this.storage.remove(guildId);
+        }));
     }
 
     /**
@@ -218,7 +232,10 @@ class ResumeManager {
     }
 
     /**
-     * Serialize a player into a JSON-safe object.
+     * Serialize a player into a JSON-safe object. If `maxQueueSize` is set,
+     * the queue is truncated to that many tracks (keeping the first N, which
+     * are the soonest-to-play) to prevent a single huge playlist from
+     * bloating storage.
      * @param {import("./Player").Player} player
      */
     serializePlayer(player) {
@@ -232,11 +249,15 @@ class ResumeManager {
               }
             : null;
 
-        const queue = (player.queue || []).map((t) => ({
+        let queue = (player.queue || []).map((t) => ({
             encoded: t.track || t.encoded || null,
             info: this._safeSerializeInfo(t.info),
             pluginInfo: t.pluginInfo || null,
         }));
+        // Cap queue size to bound per-guild storage.
+        if (this.maxQueueSize !== null && queue.length > this.maxQueueSize) {
+            queue = queue.slice(0, this.maxQueueSize);
+        }
 
         return {
             guildId: player.guildId,
@@ -256,7 +277,9 @@ class ResumeManager {
     }
 
     /**
-     * Update stored state for a single player and schedule a save.
+     * Update stored state for a single player and schedule a per-guild
+     * debounced write. Each guild has its own timer, so a busy guild never
+     * delays writes for other guilds.
      * @param {import("./Player").Player} player
      */
     savePlayer(player) {
@@ -264,18 +287,38 @@ class ResumeManager {
         const serialized = this.serializePlayer(player);
         if (!serialized) return;
         this._state.players[player.guildId] = serialized;
-        this.save();
+        // Per-guild debounce.
+        if (this._saveTimers.has(player.guildId)) {
+            clearTimeout(this._saveTimers.get(player.guildId));
+        }
+        this._saveTimers.set(player.guildId, setTimeout(() => {
+            this._saveTimers.delete(player.guildId);
+            const state = this._state.players[player.guildId];
+            if (state) {
+                this.storage.save(player.guildId, state).catch((err) => {
+                    this.riffy.emit("debug", `[ResumeManager] storage.save failed for ${player.guildId}: ${err.message}`);
+                });
+            }
+        }, this.saveInterval));
     }
 
     /**
-     * Remove a player from persisted state (e.g. when destroyed).
+     * Remove a player from persisted state immediately (no debounce —
+     * destroys should be instant so the guild isn't restored next restart).
      * @param {string} guildId
      */
     removePlayer(guildId) {
         if (!this.enabled) return;
+        // Cancel any pending save for this guild.
+        if (this._saveTimers.has(guildId)) {
+            clearTimeout(this._saveTimers.get(guildId));
+            this._saveTimers.delete(guildId);
+        }
         if (this._state.players[guildId]) {
             delete this._state.players[guildId];
-            this.save();
+            this.storage.remove(guildId).catch((err) => {
+                this.riffy.emit("debug", `[ResumeManager] storage.remove failed for ${guildId}: ${err.message}`);
+            });
         }
     }
 
@@ -319,11 +362,15 @@ class ResumeManager {
         if (this._restored) return [];
         this._restored = true;
 
+        // Await any pending load (the adapter may still be reading).
+        if (this._loadPromise) {
+            try { await this._loadPromise; } catch (_) { /* already logged */ }
+        }
+
         const guildIds = Object.keys(this._state.players || {});
         if (!guildIds.length) {
             this.riffy.emit("debug", `[ResumeManager] No saved players to restore.`);
-            // Still honor clearOnRestore so a leftover empty/stale file is removed.
-            if (this.clearOnRestore) this._clearDiskFile();
+            if (this.clearOnRestore) { await this.storage.clear().catch(() => {}); }
             return [];
         }
 
@@ -344,35 +391,17 @@ class ResumeManager {
         this.riffy.emit("debug", `[ResumeManager] Restore complete (${restored.length}/${guildIds.length} succeeded).`);
 
         if (this.clearOnRestore) {
-            // Wipe in-memory state and delete the on-disk file so it isn't
-            // re-applied on the next restart. Fresh state will be written as
-            // new player activity happens.
+            // Wipe in-memory state and clear the store so it isn't re-applied
+            // on the next restart. Fresh state is written as new activity happens.
             this._state = { version: 1, savedAt: 0, players: {} };
-            this._dirty = false;
-            if (this._saveTimer) { clearTimeout(this._saveTimer); this._saveTimer = null; }
-            this._clearDiskFile();
+            for (const t of this._saveTimers.values()) clearTimeout(t);
+            this._saveTimers.clear();
+            await this.storage.clear().catch(() => {});
             this._restoredFully = true;
-            this.riffy.emit("debug", `[ResumeManager] clearOnRestore enabled — state file removed, in-memory state wiped.`);
-        } else {
-            this.save(true);
+            this.riffy.emit("debug", `[ResumeManager] clearOnRestore enabled — store cleared, in-memory state wiped.`);
         }
 
         return restored;
-    }
-
-    /**
-     * Delete the persisted state file from disk (if it exists).
-     * @private
-     */
-    _clearDiskFile() {
-        try {
-            if (fs.existsSync(this.filePath)) {
-                fs.unlinkSync(this.filePath);
-                this.riffy.emit("debug", `[ResumeManager] Deleted state file: ${this.filePath}`);
-            }
-        } catch (e) {
-            this.riffy.emit("debug", `[ResumeManager] Failed to delete state file ${this.filePath}: ${e.message}`);
-        }
     }
 
     /**
@@ -532,8 +561,12 @@ class ResumeManager {
         // Remove from persisted state so it isn't retried on every restart.
         if (this._state.players[guildId]) {
             delete this._state.players[guildId];
-            // Persist the cleanup (unless clearOnRestore will handle it).
-            if (!this.clearOnRestore) this.save(true);
+            // Persist the cleanup immediately (unless clearOnRestore will wipe all).
+            if (!this.clearOnRestore) {
+                this.storage.remove(guildId).catch((err) => {
+                    this.riffy.emit("debug", `[ResumeManager] storage.remove failed for ${guildId} after failed restore: ${err.message}`);
+                });
+            }
         }
 
         this.riffy.emit("debug", `[ResumeManager] Restore FAILED for guild ${guildId}: reason="${reason}", detail="${detail}". Player destroyed, state removed.`);
@@ -600,13 +633,20 @@ class ResumeManager {
         riffy.on("playerDestroy", (player) => this.removePlayer(player.guildId));
 
         // playerUpdate fires frequently (~every 5s) from Lavalink with the
-        // current position. Throttled via saveInterval.
+        // current position. Throttled via saveInterval (per-guild).
         riffy.on("playerUpdate", (player) => this.savePlayer(player));
 
-        // Best-effort final flush on process exit (sync write).
+        // Best-effort final flush on process exit. Flushes all pending
+        // per-guild debounced writes synchronously (the adapters use sync fs
+        // writes under the hood, so this works on the exit tick).
         const safeFlush = () => {
             try {
-                this._flush();
+                for (const [guildId, timer] of this._saveTimers) {
+                    clearTimeout(timer);
+                    const state = this._state.players[guildId];
+                    if (state) this.storage.save(guildId, state).catch(() => {});
+                }
+                this._saveTimers.clear();
             } catch (_) {
                 /* ignore */
             }
@@ -623,14 +663,14 @@ class ResumeManager {
     }
 
     /**
-     * Clear all persisted state — both in-memory and the on-disk file.
+     * Clear all persisted state — both in-memory and the backing store.
      * Useful for testing or a manual reset.
      */
-    clear() {
+    async clear() {
         this._state = { version: 1, savedAt: 0, players: {} };
-        this._dirty = false;
-        if (this._saveTimer) { clearTimeout(this._saveTimer); this._saveTimer = null; }
-        this._clearDiskFile();
+        for (const t of this._saveTimers.values()) clearTimeout(t);
+        this._saveTimers.clear();
+        await this.storage.clear().catch(() => {});
     }
 
     /**
