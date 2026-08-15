@@ -205,6 +205,120 @@ export declare class Plugin {
     unload(riffy: Riffy): void;
 }
 
+/**
+ * Serialized form of a Track used for disk persistence.
+ * @since 1.0.13
+ */
+export interface SerializedTrack {
+    encoded: string | null;
+    info: Record<string, any> | null;
+    pluginInfo: object | null;
+}
+
+/**
+ * Serialized form of a Player used for disk persistence.
+ * @since 1.0.13
+ */
+export interface SerializedPlayer {
+    guildId: string;
+    voiceChannel: string | null;
+    textChannel: string | null;
+    volume: number;
+    loop: LoopOption;
+    paused: boolean;
+    playing: boolean;
+    position: number;
+    deaf: boolean;
+    mute: boolean;
+    current: SerializedTrack | null;
+    queue: SerializedTrack[];
+    savedAt: number;
+}
+
+/**
+ * ResumeManager — provides client-restart auto-resume for Riffy.
+ *
+ * Persists player state (voice channel, current track, playback position,
+ * volume, loop, paused, and the full queue) to a JSON file on disk and
+ * restores all players after the bot process restarts: rejoins the same
+ * voice channel, re-sends the current track at the saved position (seek),
+ * and rebuilds the queue.
+ *
+ * @since 1.0.13
+ */
+export declare class ResumeManager {
+    constructor(riffy: Riffy, options?: ResumeOptions & { requesterResolver?: (requester: any) => any });
+
+    public riffy: Riffy;
+    public enabled: boolean;
+    public filePath: string;
+    public saveInterval: number;
+    /**
+     * When `true`, the persisted state file is deleted and the in-memory
+     * state is wiped once `restoreAll()` completes.
+     * @since 1.0.14
+     */
+    public clearOnRestore: boolean;
+    /**
+     * Max time (ms) to wait for voice credentials per player during restore.
+     * @since 1.0.14
+     */
+    public restoreTimeout: number;
+
+    /**
+     * Read-only snapshot of the current in-memory persisted state.
+     */
+    get snapshot(): { version: number; savedAt: number; players: Record<string, SerializedPlayer> };
+
+    /**
+     * Load persisted state from disk into memory.
+     * @returns `true` if any players were loaded.
+     */
+    public load(): boolean;
+
+    /**
+     * Schedule a debounced disk write. Pass `true` to flush synchronously.
+     */
+    public save(immediate?: boolean): void;
+
+    /**
+     * Serialize a player into a JSON-safe object.
+     */
+    public serializePlayer(player: Player): SerializedPlayer | null;
+
+    /**
+     * Update stored state for a single player and schedule a save.
+     */
+    public savePlayer(player: Player): void;
+
+    /**
+     * Remove a player from persisted state.
+     */
+    public removePlayer(guildId: string): void;
+
+    /**
+     * Restore all players from persisted state. Safe to call once
+     * (subsequent calls are no-ops unless state was reloaded).
+     */
+    public restoreAll(): Promise<Player[]>;
+
+    /**
+     * Restore a single player from serialized state.
+     */
+    public restorePlayer(state: SerializedPlayer): Promise<Player | null>;
+
+    /**
+     * Attach event listeners to automatically persist state on player changes.
+     */
+    public attachListeners(): void;
+
+    /**
+     * Clear all persisted state — both in-memory and the on-disk file.
+     * Useful for testing or a manual reset.
+     */
+    public clear(): void;
+}
+
 export interface PlayerOptions {
     guildId: string;
     textChannel?: string;
@@ -338,6 +452,17 @@ export declare class Player extends EventEmitter {
      * @throws {Error} If `newNode` provided is same as the Player's current Node.
      */
     public moveTo(newNode: Node): Promise<Player>;
+
+    /**
+     * Restarts the player — rejoins the configured voice channel and resumes
+     * playback of the current track at the last known position.
+     *
+     * Used by Node-level `autoResume` and the client-restart ResumeManager.
+     *
+     * @since 1.0.13
+     * @emits playerResumed
+     */
+    public restart(): Promise<Player>;
 }
 
 export type SearchPlatform = "ytsearch" | "ytmsearch" | "scsearch" | "spsearch" | "amsearch" | "dzsearch" | "ymsearch" | (string & {});
@@ -429,7 +554,7 @@ export type RiffyOptions = {
 
     plugins?: Array<Plugin>;
     /**
-     * @description Default is false (only one track) 
+     * @description Default is false (only one track)
      */
     multipleTrackHistory?: number | boolean;
     /**
@@ -438,7 +563,94 @@ export type RiffyOptions = {
     bypassChecks: {
         nodeFetchInfo: boolean;
     }
+
+    /**
+     * Client-restart auto-resume configuration.
+     *
+     * When enabled, Riffy persists each player's state (voice channel, text
+     * channel, current track, playback position, volume, loop mode, paused
+     * state, and the full queue) to a JSON file on disk. After the bot
+     * process restarts, all players are automatically restored: Riffy
+     * rejoins the same voice channel, re-sends the current track to the
+     * Lavalink node at the saved position (seek), and rebuilds the queue.
+     *
+     * This is distinct from `autoResume` (Node-level), which only handles
+     * Lavalink WebSocket reconnects within a single process lifetime.
+     *
+     * @since 1.0.13
+     */
+    resume?: ResumeOptions;
 } & Exclude<NodeOptions, "sessionId">
+
+/**
+ * Options for the client-restart resume feature.
+ * @since 1.0.13
+ */
+export type ResumeOptions = {
+    /**
+     * Enable client-restart resume. Default: false.
+     */
+    enabled: boolean;
+    /**
+     * Path to the JSON file where player state is persisted.
+     * Default: `<cwd>/riffy-state.json`.
+     */
+    filePath?: string;
+    /**
+     * Debounce window (ms) for disk writes. Lower = fresher state, higher I/O.
+     * Default: 3000.
+     */
+    saveInterval?: number;
+    /**
+     * Optional function to rebuild a `requester` object from its persisted
+     * (primitive/id) form after a restore. If omitted, the requester remains
+     * a primitive (usually a user ID string).
+     */
+    requesterResolver?: (requester: any) => any;
+    /**
+     * When `true`, the persisted state file is deleted from disk once a full
+     * restore completes, and the in-memory state is wiped. This prevents
+     * stale state from accumulating and being re-applied on every subsequent
+     * restart — once the resume has happened, the slate is clean and fresh
+     * state is written only as new player activity occurs.
+     *
+     * Default: `false` (state is kept across restarts).
+     *
+     * @since 1.0.14
+     */
+    clearOnRestore?: boolean;
+    /**
+     * Maximum time (ms) to wait for voice credentials when restoring a single
+     * player. If Discord doesn't reply with a VOICE_SERVER_UPDATE in time
+     * (e.g. the voice channel was deleted, the bot was kicked from the guild,
+     * or it lacks the Connect permission), the restore for that guild is
+     * aborted: the half-created player is destroyed, the guild is removed
+     * from persisted state (so it isn't retried forever), and a
+     * `playerRestoreFailed` event is emitted with reason `"timeout"`.
+     *
+     * Discord may also send a `WebSocketClosedEvent` with a fatal code
+     * (4006 / 4009 / 4014 / 4015) during the restore window — this aborts
+     * immediately with reason `"socket_closed"` without waiting for the
+     * full timeout.
+     *
+     * Default: `15000` (15 seconds).
+     *
+     * @since 1.0.14
+     */
+    restoreTimeout?: number;
+};
+
+/**
+ * The reason a player restore failed. Emitted as the 2nd argument of the
+ * `playerRestoreFailed` event.
+ * @since 1.0.14
+ */
+export type RestoreFailReason =
+    | "timeout"        // voice credentials not received in time (channel deleted / no permission / kicked)
+    | "socket_closed"  // Discord sent a fatal WebSocketClosedEvent (codes 4006/4009/4014/4015)
+    | "no_nodes"       // no connected Lavalink nodes available
+    | "invalid_state"  // persisted state was missing required fields
+    | "error";         // any other unexpected error
 
 export declare const enum RiffyEventType {
     // Node Events
@@ -465,6 +677,19 @@ export declare const enum RiffyEventType {
     PlayerUpdate = "playerUpdate",
     PlayerMigrationFailed = "playerMigrationFailed",
     PlayerMigrated = "playerMigrated",
+    /**
+     * Emitted when a player has been restored/resumed after a client restart
+     * or node reconnect (via ResumeManager or `Player.restart()`).
+     * @since 1.0.13
+     */
+    PlayerResumed = "playerResumed",
+    /**
+     * Emitted when a player could NOT be restored after a client restart
+     * (e.g. voice channel was deleted, bot was kicked, missing Connect
+     * permission, or the persisted state was invalid/corrupt).
+     * @since 1.0.14
+     */
+    PlayerRestoreFailed = "playerRestoreFailed",
     QueueEnd = "queueEnd",
 
     // Misc Events
@@ -634,6 +859,43 @@ export type RiffyEvents = {
     "playerMigrated": (player: Player, oldNode: Node, newNode: Node) => void;
 
     /**
+     * Emitted when a player has been restored/resumed after a client restart
+     * or node reconnect. The player has rejoined its voice channel and
+     * playback has been (or will be) resumed at the saved position.
+     *
+     * @param player The player that was resumed.
+     * @since 1.0.13
+     */
+    "playerResumed": (player: Player) => void;
+
+    /**
+     * Emitted when a player could NOT be restored after a client restart.
+     *
+     * Common causes:
+     *   - `"timeout"` — the voice channel was deleted, the bot was kicked
+     *     from the guild, or it lacks the Connect permission (Discord never
+     *     replied with a VOICE_SERVER_UPDATE within `restoreTimeout`).
+     *   - `"socket_closed"` — Discord sent a fatal WebSocketClosedEvent
+     *     (codes 4006 / 4009 / 4014 / 4015) during the restore window.
+     *   - `"no_nodes"` — no Lavalink nodes were connected.
+     *   - `"invalid_state"` — the persisted state was missing required fields.
+     *   - `"error"` — any other unexpected error.
+     *
+     * When this fires, the half-created player has already been destroyed
+     * and the guild has been removed from persisted state (so it won't be
+     * retried on every restart). Use this to notify users, e.g. send a
+     * message to the persisted `textChannel` saying the bot couldn't rejoin.
+     *
+     * @param guildId The guild ID whose restore failed.
+     * @param reason One of {@link RestoreFailReason}.
+     * @param detail Human-readable detail string.
+     * @param state The persisted player state that failed to restore (may
+     *   include `textChannel` so you can notify the user).
+     * @since 1.0.14
+     */
+    "playerRestoreFailed": (guildId: string, reason: RestoreFailReason, detail: string, state: SerializedPlayer | null) => void;
+
+    /**
      * Emitted when a player's queue ends
      * @param player The player that had its queue end.
      */
@@ -774,6 +1036,14 @@ export declare class Riffy extends EventEmitter {
      */
     public readonly version: string
 
+    /**
+     * Client-restart resume manager. Persists player state to disk and
+     * restores players after a bot process restart. `null` unless
+     * `options.resume.enabled` is `true`.
+     * @since 1.0.13
+     */
+    public resumeManager: ResumeManager | null;
+
     private _defaultMigrationStrategy(player: Player, availableNodes: Node[]): Node | undefined | null
 
     public readonly leastUsedNodes: Array<Node>;
@@ -784,6 +1054,15 @@ export declare class Riffy extends EventEmitter {
     public readonly bestNode: Node | null | undefined;
 
     public init(clientId: string): this | void;
+
+    /**
+     * Manually trigger restoration of all persisted players. Useful when
+     * auto-restore is disabled or you want to re-run restore later.
+     * No-op (returns `[]`) if resume is not enabled.
+     * @since 1.0.13
+     * @returns A promise resolving to the array of restored players.
+     */
+    public resumePlayers(): Promise<Player[]>;
 
     public createNode(options: LavalinkNode): Node;
 

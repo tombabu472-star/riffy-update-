@@ -2,6 +2,7 @@ const { EventEmitter } = require("node:events");
 const { Node } = require("./Node");
 const { Player } = require("./Player");
 const { Track } = require("./Track");
+const { ResumeManager } = require("./ResumeManager");
 // @ts-ignore
 const { version: pkgVersion } = require("../../package.json")
 
@@ -52,6 +53,18 @@ class Riffy extends EventEmitter {
      */
     this.version = pkgVersion;
 
+    /**
+     * Client-restart resume manager. Persists player state (voice channel,
+     * current track, position, queue, volume, loop, paused) to disk and
+     * restores all players after the bot process restarts.
+     *
+     * Initialized in `init()` when `options.resume.enabled` is true.
+     * @type {ResumeManager | null}
+     */
+    this.resumeManager = null;
+    this._resumeOptions = options.resume || null;
+    this._resumeRestorePending = !!(options.resume && options.resume.enabled);
+
     if (this.restVersion && !versions.includes(this.restVersion)) throw new RangeError(`${this.restVersion} is not a valid version`);
   }
 
@@ -75,7 +88,7 @@ class Riffy extends EventEmitter {
 
   /**
    * Initialize Riffy
-   * @param {string} clientId 
+   * @param {string} clientId
    */
   init(clientId) {
     if (this.initiated) return this;
@@ -91,6 +104,39 @@ class Riffy extends EventEmitter {
       this.emit("debug", `Loading ${this.plugins.length} Riffy plugin(s)`);
       this.plugins.forEach((plugin) => plugin.load(this));
     }
+
+    // Set up client-restart resume (disk persistence + auto-restore).
+    if (this._resumeOptions && this._resumeOptions.enabled) {
+      this.resumeManager = new ResumeManager(this, this._resumeOptions);
+      this.resumeManager.load();
+      this.resumeManager.attachListeners();
+      this.emit("debug", `[Riffy] Client-restart resume enabled (state file: ${this.resumeManager.filePath}, saveInterval: ${this.resumeManager.saveInterval}ms).`);
+
+      // Auto-restore all players once the first node is ready (has a session).
+      this.once("nodeConnect", () => {
+        // Small delay to ensure the node session is fully usable.
+        setTimeout(() => {
+          if (this.resumeManager) {
+            this.resumeManager.restoreAll().catch((err) => {
+              this.emit("debug", `[Riffy] Auto-restore failed: ${err.message}`);
+            });
+          }
+        }, 1000);
+      });
+    }
+  }
+
+  /**
+   * Manually trigger restoration of all persisted players. Useful when
+   * `resume.autoRestore` is disabled or you want to re-run restore later.
+   * @returns {Promise<Array<Player>>}
+   */
+  async resumePlayers() {
+    if (!this.resumeManager) {
+      this.emit("debug", `[Riffy] resumePlayers() called but resume is not enabled.`);
+      return [];
+    }
+    return this.resumeManager.restoreAll();
   }
 
   /**
