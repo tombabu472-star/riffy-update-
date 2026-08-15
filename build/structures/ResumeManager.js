@@ -449,9 +449,21 @@ class ResumeManager {
         // waiting the full restoreTimeout.
         let settleTimer = null;
         let socketClosedHandler = null;
+        // Abort flag: set by the reject function (timeout / socketClosed) so
+        // the async executor still running in _sendResumePayload can bail out
+        // instead of PATCHing Lavalink + emitting playerResumed AFTER the
+        // restore has already been treated as failed. Without this, a late
+        // VOICE_SERVER_UPDATE would let the executor resurrect a destroyed
+        // player (race condition flagged in review).
+        let aborted = false;
+        const isAborted = () => aborted;
         const restorePromise = new Promise(async (resolve, reject) => {
             // Register the reject so socketClosed / timeout can abort.
-            this._pendingRestores.set(guildId, (reason, detail) => reject({ reason, detail }));
+            // Setting `aborted = true` first ensures the executor checks it.
+            this._pendingRestores.set(guildId, (reason, detail) => {
+                aborted = true;
+                reject({ reason, detail });
+            });
 
             try {
                 // 1. Re-create the connection -> sends VOICE_STATE_UPDATE to rejoin.
@@ -469,29 +481,41 @@ class ResumeManager {
                 if (typeof state.volume === "number") player.volume = state.volume;
                 if (state.loop) player.loop = state.loop;
 
-                // 3. Rebuild the queue.
-                if (Array.isArray(state.queue)) {
+                // 3. Rebuild the queue. Bail out if aborted mid-rebuild.
+                if (Array.isArray(state.queue) && !isAborted()) {
                     for (const t of state.queue) {
                         const rebuilt = await this._rebuildTrack(t, node);
                         if (rebuilt) player.queue.add(rebuilt);
+                        if (isAborted()) break;
                     }
                 }
 
                 // 4. Restore current track + seek to the saved position.
-                if (state.current && (state.current.encoded || (state.current.info && state.current.info.identifier))) {
+                if (!isAborted() && state.current && (state.current.encoded || (state.current.info && state.current.info.identifier))) {
                     const currentTrack = await this._rebuildTrack(state.current, node);
                     player.current = currentTrack;
                     player.position = state.position || 0;
                     player.paused = state.paused ?? false;
 
                     // Send the resume payload once voice credentials arrive.
-                    await this._sendResumePayload(player, state);
-                } else if (player.queue.length > 0) {
+                    // Pass isAborted so it can bail out if voice creds arrive
+                    // AFTER a timeout/socketClosed already aborted the restore.
+                    await this._sendResumePayload(player, state, isAborted);
+                } else if (!isAborted() && player.queue.length > 0) {
                     try {
                         await player.play();
                     } catch (e) {
                         this.riffy.emit("debug", `[ResumeManager] Auto-play after restore failed for ${guildId}: ${e.message}`);
                     }
+                }
+
+                // If the restore was aborted while we were waiting, do NOT
+                // resolve — the promise has already been rejected, and the
+                // caller's catch block runs _failRestore. Resolving here would
+                // be a no-op (promise already settled), but we also must not
+                // emit the "Restored player" debug line.
+                if (isAborted()) {
+                    return;
                 }
 
                 this.riffy.emit(
@@ -500,7 +524,8 @@ class ResumeManager {
                 );
                 resolve(player);
             } catch (err) {
-                reject({ reason: "error", detail: err });
+                // If aborted, prefer the abort reason over this error.
+                if (!isAborted()) reject({ reason: "error", detail: err });
             }
         });
 
@@ -601,12 +626,29 @@ class ResumeManager {
      * We must NOT swallow it and proceed to PATCH the track + emit
      * playerResumed — that would treat a failed restore as successful.
      *
+     * RACE FIX: If the restore was aborted (timeout / socketClosed) WHILE
+     * we're awaiting connection.resolve(), the caller's _failRestore has
+     * already destroyed the player + emitted playerRestoreFailed. If voice
+     * creds then arrive, we must NOT PATCH Lavalink or emit playerResumed —
+     * that would resurrect a destroyed player. The `isAborted` callback is
+     * checked after the await and before the PATCH to bail out cleanly.
+     *
      * @private
+     * @param {() => boolean} [isAborted] Returns true if the restore was aborted.
      */
-    async _sendResumePayload(player, state) {
+    async _sendResumePayload(player, state, isAborted = () => false) {
         // This throws if Discord doesn't supply voice credentials. Let it
         // propagate so the restore is treated as a failure, not a success.
         await player.connection.resolve();
+
+        // RACE FIX: voice creds arrived, but the restore may have already
+        // been aborted (timeout / socketClosed) while we were waiting. If so,
+        // _failRestore has already destroyed the player + emitted
+        // playerRestoreFailed. Bail out — do NOT PATCH or emit playerResumed.
+        if (isAborted()) {
+            this.riffy.emit("debug", `[ResumeManager] Voice credentials arrived for ${player.guildId} but restore was already aborted; not patching/emitting.`);
+            return;
+        }
 
         const encoded = state.current?.encoded || player.current?.track || player.current?.encoded;
         if (!encoded) {
@@ -623,6 +665,13 @@ class ResumeManager {
                 paused: state.paused ?? false,
             },
         });
+
+        // Re-check after the PATCH too — if aborted during the PATCH request,
+        // don't flip state or emit playerResumed.
+        if (isAborted()) {
+            this.riffy.emit("debug", `[ResumeManager] Restore aborted during PATCH for ${player.guildId}; not emitting playerResumed.`);
+            return;
+        }
 
         player.playing = !(state.paused ?? false);
         player.paused = state.paused ?? false;
