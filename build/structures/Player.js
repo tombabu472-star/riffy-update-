@@ -167,7 +167,26 @@ class Player extends EventEmitter {
                 throw new Error(`Unable to play for Player with Guild Id ${this.guildId}, Track is not encoded and cannot be resolved.`);
             }
 
+            // resolve() can return undefined when no search results are found.
+            // Capture the track before reassignment so we can report it.
+            const unresolvedTrack = this.current;
             this.current = await this.current.resolve(this.riffy);
+
+            // If resolve() returned undefined/null, the track can't be played.
+            // Skip it (emit trackError for visibility) and try the next one,
+            // or emit queueEnd if the queue is now empty. This prevents the
+            // "Cannot destructure property 'track' of 'this.current' as it is
+            // undefined" TypeError that crashes the bot (issue #42).
+            if (!this.current) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] Track "${unresolvedTrack.info?.title || "Unknown"}" could not be resolved, skipping.`);
+                this.riffy.emit("trackError", this, unresolvedTrack, { message: "Track could not be resolved (no search results found)" });
+                if (this.queue.length > 0) {
+                    return this.play();
+                }
+                this.playing = false;
+                this.riffy.emit("queueEnd", this);
+                return this;
+            }
         }
 
         if (!this.current?.track) {
