@@ -713,18 +713,26 @@ class ResumeManager {
 
         // RACE FIX 2 + 3: if aborted DURING/AFTER the PATCH, the PATCH may
         // have landed on Lavalink AFTER _failRestore's DELETE, recreating an
-        // orphan Lavalink player. Send a DELETE to clean it up — BUT only if
-        // the player instance we PATCHed is still the one registered for
-        // this guild. If _failRestore emitted playerRestoreFailed and the
-        // user's handler created a REPLACEMENT player, this.players.get()
-        // now points at a different instance; a guild-scoped DELETE would
-        // kill the replacement's Lavalink session (review: "replacement
-        // player's Lavalink session silently stopped").
+        // orphan Lavalink player. Send a DELETE to clean it up — UNLESS a
+        // REPLACEMENT player now exists for this guild (which would be killed
+        // by a guild-scoped DELETE).
+        //
+        // Three cases after the PATCH resolves and isAborted() is true:
+        //   1. currentPlayer === player        → original still registered, no
+        //      replacement. DELETE the orphan.
+        //   2. currentPlayer === undefined     → original was removed by
+        //      _failRestore, no replacement. DELETE the orphan. (This was the
+        //      bug: the old `=== player` check treated `undefined` as "a
+        //      replacement exists" and skipped the DELETE, leaving an orphan
+        //      Lavalink player playing after playerRestoreFailed.)
+        //   3. currentPlayer !== player && !== undefined → a REPLACEMENT
+        //      player exists. Skip the DELETE — it would kill the replacement.
         if (isAborted()) {
             const currentPlayer = this.riffy.players.get(player.guildId);
-            if (currentPlayer === player) {
-                // No replacement — safe to delete the orphan we may have
-                // just recreated on Lavalink.
+            const replacementExists = currentPlayer !== undefined && currentPlayer !== player;
+            if (!replacementExists) {
+                // No replacement (original still registered OR already removed) —
+                // safe to delete the orphan we may have just recreated on Lavalink.
                 this.riffy.emit("debug", `[ResumeManager] Restore aborted during/after PATCH for ${player.guildId}; sending DELETE to clean up orphan Lavalink player.`);
                 try {
                     await player.node.rest.destroyPlayer(player.guildId);
@@ -733,7 +741,8 @@ class ResumeManager {
                 }
             } else {
                 // A replacement player exists for this guild — do NOT send
-                // a guild-scoped DELETE, it would kill the replacement.
+                // a guild-scoped DELETE, it would kill the replacement's
+                // Lavalink session.
                 this.riffy.emit("debug", `[ResumeManager] Restore aborted after PATCH for ${player.guildId}, but a replacement player is now registered; skipping orphan-cleanup DELETE to avoid killing the replacement's Lavalink session.`);
             }
             return;
