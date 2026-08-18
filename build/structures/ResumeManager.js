@@ -574,14 +574,37 @@ class ResumeManager {
     /**
      * Handle a failed restore: destroy any half-created player, remove the
      * guild from persisted state, and emit `playerRestoreFailed`.
+     *
+     * Sends an explicit, AWAITED DELETE to Lavalink (not just
+     * player.destroy(), which dispatches destroyPlayer() without awaiting
+     * it). This ensures the DELETE is ordered relative to any in-flight
+     * PATCH from _sendResumePayload — if the PATCH lands AFTER this DELETE,
+     * _sendResumePayload's post-PATCH orphan-cleanup DELETE removes the
+     * recreated Lavalink player.
+     *
      * @private
      */
     async _failRestore(guildId, reason, detail, state) {
         if (!guildId) return;
 
-        // Destroy the half-created player if it exists.
+        // Destroy the half-created player if it exists. We send an explicit,
+        // AWAITED DELETE to Lavalink here because Player.destroy() calls
+        // node.rest.destroyPlayer() WITHOUT awaiting it (the promise is
+        // discarded). That matters for this race: if a PATCH from
+        // _sendResumePayload is in flight when this fires, an unawaited
+        // DELETE could complete before OR after the PATCH lands — and if
+        // the PATCH lands AFTER the DELETE, it recreates an orphan Lavalink
+        // player. By awaiting our own DELETE here, the local cleanup is
+        // ordered relative to any PATCH, and _sendResumePayload's
+        // post-PATCH orphan-cleanup DELETE handles the other ordering.
         const player = this.riffy.players.get(guildId);
         if (player) {
+            // Send an awaited DELETE to Lavalink first (local cleanup below).
+            try {
+                await player.node.rest.destroyPlayer(guildId);
+            } catch (e) {
+                this.riffy.emit("debug", `[ResumeManager] destroyPlayer DELETE failed for ${guildId}: ${e.message}`);
+            }
             try {
                 player.destroy();
             } catch (e) {
@@ -626,12 +649,20 @@ class ResumeManager {
      * We must NOT swallow it and proceed to PATCH the track + emit
      * playerResumed — that would treat a failed restore as successful.
      *
-     * RACE FIX: If the restore was aborted (timeout / socketClosed) WHILE
+     * RACE FIX 1: If the restore was aborted (timeout / socketClosed) WHILE
      * we're awaiting connection.resolve(), the caller's _failRestore has
      * already destroyed the player + emitted playerRestoreFailed. If voice
      * creds then arrive, we must NOT PATCH Lavalink or emit playerResumed —
      * that would resurrect a destroyed player. The `isAborted` callback is
      * checked after the await and before the PATCH to bail out cleanly.
+     *
+     * RACE FIX 2: If the abort fires WHILE the PATCH is in flight, the
+     * PATCH may land on Lavalink AFTER _failRestore's DELETE (sent via
+     * player.destroy()), recreating an orphan Lavalink player that keeps
+     * playing. So after the PATCH resolves, if aborted, we send a DELETE
+     * to clean up any orphan Lavalink player the PATCH may have created.
+     * _failRestore also now awaits player.destroy() so the DELETE is
+     * ordered relative to the PATCH.
      *
      * @private
      * @param {() => boolean} [isAborted] Returns true if the restore was aborted.
@@ -641,7 +672,7 @@ class ResumeManager {
         // propagate so the restore is treated as a failure, not a success.
         await player.connection.resolve();
 
-        // RACE FIX: voice creds arrived, but the restore may have already
+        // RACE FIX 1: voice creds arrived, but the restore may have already
         // been aborted (timeout / socketClosed) while we were waiting. If so,
         // _failRestore has already destroyed the player + emitted
         // playerRestoreFailed. Bail out — do NOT PATCH or emit playerResumed.
@@ -666,10 +697,20 @@ class ResumeManager {
             },
         });
 
-        // Re-check after the PATCH too — if aborted during the PATCH request,
-        // don't flip state or emit playerResumed.
+        // RACE FIX 2: if aborted DURING the PATCH, the PATCH may have landed
+        // on Lavalink AFTER _failRestore's DELETE, recreating an orphan
+        // Lavalink player. Send a DELETE to clean it up. _failRestore has
+        // already destroyed the local player + emitted playerRestoreFailed;
+        // we just need to ensure Lavalink's side is also gone.
         if (isAborted()) {
-            this.riffy.emit("debug", `[ResumeManager] Restore aborted during PATCH for ${player.guildId}; not emitting playerResumed.`);
+            this.riffy.emit("debug", `[ResumeManager] Restore aborted during/after PATCH for ${player.guildId}; sending DELETE to clean up orphan Lavalink player.`);
+            try {
+                await player.node.rest.destroyPlayer(player.guildId);
+            } catch (e) {
+                // Best-effort — the orphan cleanup is a safety net; if the
+                // DELETE fails (e.g. player already gone), that's fine.
+                this.riffy.emit("debug", `[ResumeManager] Orphan-cleanup DELETE failed for ${player.guildId}: ${e.message}`);
+            }
             return;
         }
 
