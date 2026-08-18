@@ -502,11 +502,15 @@ class ResumeManager {
                     // AFTER a timeout/socketClosed already aborted the restore.
                     await this._sendResumePayload(player, state, isAborted);
                 } else if (!isAborted() && player.queue.length > 0) {
-                    try {
-                        await player.play();
-                    } catch (e) {
-                        this.riffy.emit("debug", `[ResumeManager] Auto-play after restore failed for ${guildId}: ${e.message}`);
-                    }
+                    // No current track but queue has items — start playback.
+                    // If this fails (e.g. voice init failed, track unresolvable),
+                    // the error MUST propagate so restorePlayer's catch block
+                    // calls _failRestore → destroys the player, removes it from
+                    // state, and emits playerRestoreFailed. Previously this catch
+                    // swallowed the error, leaving an unusable player registered
+                    // with no failure event (review: "Queue restore reports
+                    // false success").
+                    await player.play();
                 }
 
                 // If the restore was aborted while we were waiting, do NOT
@@ -664,7 +668,17 @@ class ResumeManager {
      * _failRestore also now awaits player.destroy() so the DELETE is
      * ordered relative to the PATCH.
      *
+     * RACE FIX 3 (replacement player): the orphan-cleanup DELETE is
+     * guild-scoped, but by the time it fires, _failRestore has already
+     * emitted playerRestoreFailed. If the user's handler created a
+     * REPLACEMENT player for the same guild, this.players.get(guildId)
+     * now points at a DIFFERENT instance. A blind guild-scoped DELETE
+     * would kill the replacement's Lavalink session. So we only send the
+     * orphan-cleanup DELETE if the player instance we PATCHed is still
+     * the one registered for that guild (i.e. no replacement exists).
+     *
      * @private
+     * @param {import("./Player").Player} player The player being resumed (captured by ref).
      * @param {() => boolean} [isAborted] Returns true if the restore was aborted.
      */
     async _sendResumePayload(player, state, isAborted = () => false) {
@@ -697,19 +711,30 @@ class ResumeManager {
             },
         });
 
-        // RACE FIX 2: if aborted DURING the PATCH, the PATCH may have landed
-        // on Lavalink AFTER _failRestore's DELETE, recreating an orphan
-        // Lavalink player. Send a DELETE to clean it up. _failRestore has
-        // already destroyed the local player + emitted playerRestoreFailed;
-        // we just need to ensure Lavalink's side is also gone.
+        // RACE FIX 2 + 3: if aborted DURING/AFTER the PATCH, the PATCH may
+        // have landed on Lavalink AFTER _failRestore's DELETE, recreating an
+        // orphan Lavalink player. Send a DELETE to clean it up — BUT only if
+        // the player instance we PATCHed is still the one registered for
+        // this guild. If _failRestore emitted playerRestoreFailed and the
+        // user's handler created a REPLACEMENT player, this.players.get()
+        // now points at a different instance; a guild-scoped DELETE would
+        // kill the replacement's Lavalink session (review: "replacement
+        // player's Lavalink session silently stopped").
         if (isAborted()) {
-            this.riffy.emit("debug", `[ResumeManager] Restore aborted during/after PATCH for ${player.guildId}; sending DELETE to clean up orphan Lavalink player.`);
-            try {
-                await player.node.rest.destroyPlayer(player.guildId);
-            } catch (e) {
-                // Best-effort — the orphan cleanup is a safety net; if the
-                // DELETE fails (e.g. player already gone), that's fine.
-                this.riffy.emit("debug", `[ResumeManager] Orphan-cleanup DELETE failed for ${player.guildId}: ${e.message}`);
+            const currentPlayer = this.riffy.players.get(player.guildId);
+            if (currentPlayer === player) {
+                // No replacement — safe to delete the orphan we may have
+                // just recreated on Lavalink.
+                this.riffy.emit("debug", `[ResumeManager] Restore aborted during/after PATCH for ${player.guildId}; sending DELETE to clean up orphan Lavalink player.`);
+                try {
+                    await player.node.rest.destroyPlayer(player.guildId);
+                } catch (e) {
+                    this.riffy.emit("debug", `[ResumeManager] Orphan-cleanup DELETE failed for ${player.guildId}: ${e.message}`);
+                }
+            } else {
+                // A replacement player exists for this guild — do NOT send
+                // a guild-scoped DELETE, it would kill the replacement.
+                this.riffy.emit("debug", `[ResumeManager] Restore aborted after PATCH for ${player.guildId}, but a replacement player is now registered; skipping orphan-cleanup DELETE to avoid killing the replacement's Lavalink session.`);
             }
             return;
         }
