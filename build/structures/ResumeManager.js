@@ -66,6 +66,16 @@ class ResumeManager {
          * @since 1.0.15
          */
         this.maxQueueSize = options.maxQueueSize ?? null;
+        /**
+         * Max number of players to restore in parallel. Each restorePlayer
+         * involves a per-guild voice handshake that can take up to
+         * restoreTimeout. Restoring sequentially would stack these windows
+         * (50 guilds × 15s = 12.5 min worst case). Bounded concurrency keeps
+         * restores parallel without overwhelming the Discord gateway.
+         * Default: 8.
+         * @since 1.0.15
+         */
+        this.restoreConcurrency = typeof options.restoreConcurrency === "number" ? options.restoreConcurrency : 8;
 
         /** @type {{ version: number, savedAt: number, players: Record<string, any> }} */
         this._state = { version: 1, savedAt: 0, players: {} };
@@ -76,7 +86,7 @@ class ResumeManager {
         this._pendingRestores = new Map();
         /** @type {Map<string, NodeJS.Timeout>} guildId -> per-guild debounce timer */
         this._saveTimers = new Map();
-        /** @type {Promise<Map<string, any>> | null} */
+        /** @type {Promise<boolean> | null} load() promise (in-flight or null). */
         this._loadPromise = null;
 
         /** @type {StorageAdapter} */
@@ -369,7 +379,14 @@ class ResumeManager {
      */
     async restoreAll() {
         if (!this.enabled) return [];
-        if (this._restored) return [];
+        // Guard: restoreAll is idempotent — once it has run (even partially),
+        // it won't run again unless load() is called to reload state. This
+        // prevents duplicate restores if init()'s nodeConnect handler fires
+        // multiple times or resumePlayers() is called manually after init.
+        if (this._restored) {
+            this.riffy.emit("debug", `[ResumeManager] restoreAll() already ran, skipping (call load() to reload state first).`);
+            return [];
+        }
         this._restored = true;
 
         // Await any pending load (the adapter may still be reading).
@@ -384,19 +401,35 @@ class ResumeManager {
             return [];
         }
 
-        this.riffy.emit("debug", `[ResumeManager] Restoring ${guildIds.length} player(s)...`);
+        this.riffy.emit("debug", `[ResumeManager] Restoring ${guildIds.length} player(s) (concurrency=${this.restoreConcurrency})...`);
         const restored = [];
 
-        for (const guildId of guildIds) {
-            const state = this._state.players[guildId];
-            try {
-                const player = await this.restorePlayer(state);
-                if (player) restored.push(player);
-            } catch (e) {
-                this.riffy.emit("debug", `[ResumeManager] Failed to restore player ${guildId}: ${e.message}`);
-                delete this._state.players[guildId];
+        // Restore players concurrently with a bounded concurrency limit so a
+        // bot in 50+ guilds doesn't restore sequentially (each restoreTimeout
+        // window would otherwise stack: 50 × 15s = 12.5 min worst case).
+        // Each restorePlayer is independent (per-guild voice handshakes), so
+        // they can run in parallel safely.
+        const concurrency = Math.max(1, this.restoreConcurrency);
+        const queue = [...guildIds];
+        const workers = [];
+        const worker = async () => {
+            while (queue.length > 0) {
+                const guildId = queue.shift();
+                const state = this._state.players[guildId];
+                if (!state) continue;
+                try {
+                    const player = await this.restorePlayer(state);
+                    if (player) restored.push(player);
+                } catch (e) {
+                    this.riffy.emit("debug", `[ResumeManager] Failed to restore player ${guildId}: ${e.message}`);
+                    delete this._state.players[guildId];
+                }
             }
+        };
+        for (let i = 0; i < Math.min(concurrency, guildIds.length); i++) {
+            workers.push(worker());
         }
+        await Promise.allSettled(workers);
 
         this.riffy.emit("debug", `[ResumeManager] Restore complete (${restored.length}/${guildIds.length} succeeded).`);
 
@@ -610,7 +643,9 @@ class ResumeManager {
                 this.riffy.emit("debug", `[ResumeManager] destroyPlayer DELETE failed for ${guildId}: ${e.message}`);
             }
             try {
-                player.destroy();
+                // skipRest=true: we already sent the DELETE above, so don't
+                // let player.destroy() fire a second (unawaited) one.
+                player.destroy(true);
             } catch (e) {
                 this.riffy.emit("debug", `[ResumeManager] Error destroying failed player for ${guildId}: ${e.message}`);
             }
@@ -775,15 +810,24 @@ class ResumeManager {
         // current position. Throttled via saveInterval (per-guild).
         riffy.on("playerUpdate", (player) => this.savePlayer(player));
 
-        // Best-effort final flush on process exit. Flushes all pending
-        // per-guild debounced writes synchronously (the adapters use sync fs
-        // writes under the hood, so this works on the exit tick).
+        // Best-effort final flush on process exit. Async I/O on process exit
+        // is unreliable (the event loop is torn down), so we prefer a sync
+        // saveSync() method if the adapter provides one (JsonFileStorage and
+        // ShardedJsonStorage do). For adapters that only have async save()
+        // (SqliteStorage, custom Redis/Postgres), we call it anyway as a last
+        // resort — it may not complete, but it's better than nothing.
         const safeFlush = () => {
             try {
                 for (const [guildId, timer] of this._saveTimers) {
                     clearTimeout(timer);
                     const state = this._state.players[guildId];
-                    if (state) this.storage.save(guildId, state).catch(() => {});
+                    if (state) {
+                        if (typeof this.storage.saveSync === "function") {
+                            this.storage.saveSync(guildId, state);
+                        } else {
+                            this.storage.save(guildId, state).catch(() => {});
+                        }
+                    }
                 }
                 this._saveTimers.clear();
             } catch (_) {

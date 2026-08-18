@@ -65,6 +65,16 @@ class JsonFileStorage extends StorageAdapter {
     }
 
     async save(guildId, state) {
+        this.saveSync(guildId, state);
+    }
+
+    /**
+     * Synchronous version of save() — used on process.exit where async I/O
+     * is unreliable (the event loop is torn down). Writes to a temp file
+     * then renames atomically.
+     * @since 1.0.15
+     */
+    saveSync(guildId, state) {
         // Read current file, merge the single guild, write back.
         // (Single-file adapter — inherent write amplification vs. sharded.)
         let parsed = { version: 1, savedAt: 0, players: {} };

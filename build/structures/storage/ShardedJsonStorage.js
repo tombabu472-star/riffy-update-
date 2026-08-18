@@ -85,6 +85,16 @@ class ShardedJsonStorage extends StorageAdapter {
     }
 
     async save(guildId, state) {
+        this.saveSync(guildId, state);
+    }
+
+    /**
+     * Synchronous version of save() — used on process.exit where async I/O
+     * is unreliable (the event loop is torn down). Writes to a temp file
+     * in the same directory, then renames atomically.
+     * @since 1.0.15
+     */
+    saveSync(guildId, state) {
         const fullPath = this._pathFor(guildId);
         // Atomic write: temp file in the same dir, then rename.
         const tmp = fullPath + ".tmp-" + process.pid;
@@ -92,7 +102,7 @@ class ShardedJsonStorage extends StorageAdapter {
             fs.writeFileSync(tmp, JSON.stringify(state, null, 2), "utf-8");
             fs.renameSync(tmp, fullPath);
         } catch (e) {
-            this._log(`save() failed for ${guildId}: ${e.message}`);
+            this._log(`saveSync() failed for ${guildId}: ${e.message}`);
             try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) { /* ignore */ }
             throw e;
         }

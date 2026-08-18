@@ -535,10 +535,16 @@ class Player extends EventEmitter {
 
     /**
      * Destroys the player.
+     *
+     * @param {boolean} [skipRest=false] If true, skip the REST DELETE call to
+     *   Lavalink (use when the caller has already sent an awaited DELETE —
+     *   e.g. ResumeManager._failRestore — to avoid a wasteful duplicate).
      */
-    destroy() {
+    destroy(skipRest = false) {
         this.disconnect();
-        this.node.rest.destroyPlayer(this.guildId);
+        if (!skipRest) {
+            this.node.rest.destroyPlayer(this.guildId);
+        }
         this.removeAllListeners();
         this.connection = null;
         this.riffy.emit("playerDisconnect", this);
@@ -810,7 +816,11 @@ class Player extends EventEmitter {
             try {
                 await this.connection.resolve();
             } catch (e) {
-                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): voice credentials not ready: ${e.message}`);
+                // Voice credentials never arrived — we cannot PATCH Lavalink.
+                // Do NOT fall through to updatePlayer (it would either fail
+                // or recreate an orphan player). Bail out.
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): voice credentials not ready, aborting: ${e.message}`);
+                return this;
             }
 
             const encoded = this.current.track || this.current.encoded;

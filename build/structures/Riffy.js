@@ -252,8 +252,9 @@ class Riffy extends EventEmitter {
   destroyPlayer(guildId) {
     const player = this.players.get(guildId);
     if (!player) return;
+    // player.destroy() already calls this.players.delete(guildId) internally,
+    // so we don't need to repeat it here.
     player.destroy();
-    this.players.delete(guildId);
 
     this.emit("playerDestroy", player);
   }

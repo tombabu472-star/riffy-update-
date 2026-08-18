@@ -280,6 +280,11 @@ export type StorageConfig =
 export declare class JsonFileStorage extends StorageAdapter {
     constructor(options?: { filePath?: string }, riffy?: Riffy);
     public filePath: string;
+    /**
+     * Synchronous save — used on process.exit where async I/O is unreliable.
+     * @since 1.0.15
+     */
+    public saveSync(guildId: string, state: any): void;
 }
 
 /**
@@ -291,6 +296,11 @@ export declare class JsonFileStorage extends StorageAdapter {
 export declare class ShardedJsonStorage extends StorageAdapter {
     constructor(options?: { dir?: string }, riffy?: Riffy);
     public dir: string;
+    /**
+     * Synchronous save — used on process.exit where async I/O is unreliable.
+     * @since 1.0.15
+     */
+    public saveSync(guildId: string, state: any): void;
 }
 
 /**
@@ -327,6 +337,11 @@ export declare class ResumeManager {
      * @since 1.0.15
      */
     public maxQueueSize: number | null;
+    /**
+     * Max players to restore in parallel.
+     * @since 1.0.15
+     */
+    public restoreConcurrency: number;
     /**
      * The active storage adapter.
      * @since 1.0.15
@@ -498,7 +513,12 @@ export declare class Player extends EventEmitter {
     }): Player;
 
     public disconnect(): Player | void;
-    public destroy(): void;
+    /**
+     * Destroys the player.
+     * @param skipRest If true, skip the REST DELETE to Lavalink (use when
+     *   the caller has already sent an awaited DELETE).
+     */
+    public destroy(skipRest?: boolean): void;
     private handleEvent(payload: NodePlayerEvent): void;
     private trackStart(player: Player, track: Track, payload: PlayerTrackStartEventPayload): void;
     private trackEnd(player: Player, track: Track, payload: PlayerTrackEndEventPayload<this["node"]["restVersion"]>): void;
@@ -718,6 +738,14 @@ export type ResumeOptions = {
      * @since 1.0.15
      */
     maxQueueSize?: number | null;
+    /**
+     * Max number of players to restore in parallel. Each restorePlayer
+     * involves a per-guild voice handshake that can take up to
+     * restoreTimeout. Restoring sequentially would stack these windows.
+     * Default: 8.
+     * @since 1.0.15
+     */
+    restoreConcurrency?: number;
     /**
      * Storage backend. Accepts:
      *   - `"json"` — single JSON file (default; fine for <~100 players)
