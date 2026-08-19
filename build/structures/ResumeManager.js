@@ -1,4 +1,3 @@
-const fs = require("node:fs");
 const path = require("node:path");
 const { Track } = require("./Track");
 const { StorageAdapter } = require("./storage/StorageAdapter");
@@ -171,6 +170,9 @@ class ResumeManager {
     _validatePlayerState(guildId, state) {
         if (!state || typeof state !== "object") return { ok: false, reason: "not an object" };
         if (typeof state.guildId !== "string" || !state.guildId) return { ok: false, reason: "missing guildId" };
+        // Cross-check: the stored state's guildId must match the key it was
+        // stored under. A mismatch indicates corruption or a storage bug.
+        if (guildId && state.guildId !== guildId) return { ok: false, reason: `guildId mismatch (key=${guildId}, state=${state.guildId})` };
         if (typeof state.voiceChannel !== "string" || !state.voiceChannel) return { ok: false, reason: "missing voiceChannel" };
         if (state.volume !== undefined && typeof state.volume !== "number") return { ok: false, reason: "volume is not a number" };
         if (state.position !== undefined && typeof state.position !== "number") return { ok: false, reason: "position is not a number" };
@@ -201,16 +203,22 @@ class ResumeManager {
      * Safely serialize a Track's info into a JSON-safe plain object.
      * The `requester` is reduced to a primitive/id (it is usually a Discord
      * User object which is not JSON-serializable due to circular refs).
+     *
+     * Field names match Lavalink v4's raw track info (isSeekable, isStream)
+     * so the serialized object can be passed directly to `new Track({ info })`
+     * on restore — the Track constructor reads info.isSeekable / info.isStream.
+     * The Track class's runtime info object uses seekable/stream (mapped from
+     * the Lavalink names), so we read those here and write the Lavalink names.
      * @private
      */
     _safeSerializeInfo(info) {
         if (!info) return null;
         const out = {
             identifier: info.identifier ?? null,
-            isSeekable: info.seekable ?? false,
+            isSeekable: info.seekable ?? info.isSeekable ?? false,
             author: info.author ?? null,
             length: info.length ?? 0,
-            isStream: info.stream ?? false,
+            isStream: info.stream ?? info.isStream ?? false,
             position: info.position ?? 0,
             title: info.title ?? null,
             uri: info.uri ?? null,
@@ -397,7 +405,10 @@ class ResumeManager {
         const guildIds = Object.keys(this._state.players || {});
         if (!guildIds.length) {
             this.riffy.emit("debug", `[ResumeManager] No saved players to restore.`);
-            if (this.clearOnRestore) { await this.storage.clear().catch(() => {}); }
+            if (this.clearOnRestore) {
+                await this.storage.clear().catch(() => {});
+                this._restoredFully = true;
+            }
             return [];
         }
 
@@ -861,6 +872,17 @@ class ResumeManager {
      */
     get snapshot() {
         return JSON.parse(JSON.stringify(this._state));
+    }
+
+    /**
+     * Whether restoreAll() has completed AND clearOnRestore wiped the store.
+     * Useful for callers to check if a full restore+clear cycle happened
+     * (e.g. to decide whether to re-arm auto-restore after a manual
+     * load() + restoreAll() cycle).
+     * @since 1.0.15
+     */
+    get isFullyRestored() {
+        return this._restoredFully;
     }
 }
 

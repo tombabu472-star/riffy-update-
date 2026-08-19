@@ -354,6 +354,12 @@ export declare class ResumeManager {
     get snapshot(): { version: number; savedAt: number; players: Record<string, SerializedPlayer> };
 
     /**
+     * Whether restoreAll() has completed AND clearOnRestore wiped the store.
+     * @since 1.0.15
+     */
+    get isFullyRestored(): boolean;
+
+    /**
      * Load persisted state from the storage adapter into memory. Async.
      * Callers may await the returned Promise, or rely on restoreAll() to
      * await it internally.
