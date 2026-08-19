@@ -785,6 +785,33 @@ class ResumeManager {
                 } catch (e) {
                     this.riffy.emit("debug", `[ResumeManager] Orphan-cleanup DELETE failed for ${player.guildId}: ${e.message}`);
                 }
+                // RACE FIX 4: a replacement player may have been created and
+                // established its Lavalink session WHILE the DELETE was in flight
+                // (the user's async playerRestoreFailed handler runs after
+                // _failRestore emits the event, and createConnection →
+                // updatePlayer can land before this DELETE completes). The
+                // guild-scoped DELETE just killed the replacement's Lavalink
+                // session. Re-send the replacement's current track to restore it.
+                const afterDelete = this.riffy.players.get(player.guildId);
+                if (afterDelete && afterDelete !== player && afterDelete.current) {
+                    this.riffy.emit("debug", `[ResumeManager] Replacement player detected after orphan-cleanup DELETE for ${player.guildId}; re-sending its track to restore the Lavalink session.`);
+                    try {
+                        const replEncoded = afterDelete.current.track || afterDelete.current.encoded;
+                        if (replEncoded) {
+                            await afterDelete.node.rest.updatePlayer({
+                                guildId: player.guildId,
+                                data: {
+                                    track: { encoded: replEncoded },
+                                    position: afterDelete.position || 0,
+                                    volume: afterDelete.volume,
+                                    paused: afterDelete.paused,
+                                },
+                            });
+                        }
+                    } catch (e) {
+                        this.riffy.emit("debug", `[ResumeManager] Re-PATCH of replacement failed for ${player.guildId}: ${e.message}`);
+                    }
+                }
             } else {
                 // A replacement player exists for this guild — do NOT send
                 // a guild-scoped DELETE, it would kill the replacement's
