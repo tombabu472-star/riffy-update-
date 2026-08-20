@@ -792,7 +792,8 @@ class ResumeManager {
                 // updatePlayer can land before this DELETE completes). The
                 // guild-scoped DELETE just killed the replacement's Lavalink
                 // session — including its voice session. Re-send the replacement's
-                // voice credentials AND track to fully restore the Lavalink session.
+                // voice credentials AND track (if any) to fully restore the
+                // Lavalink session.
                 //
                 // RACE FIX 5: the replacement's Connection records the voice
                 // credentials as already sent (#lastSentVoice === current voice),
@@ -801,37 +802,51 @@ class ResumeManager {
                 // so Lavalink re-establishes the voice connection — otherwise the
                 // replacement has a track but no voice session and produces no
                 // audio.
+                //
+                // RACE FIX 6: the replacement may have established voice
+                // credentials but NOT yet assigned a current track (it just
+                // joined the voice channel, hasn't started playing). The previous
+                // `afterDelete.current` guard would skip the recovery PATCH
+                // entirely in that case — but the DELETE still killed the
+                // replacement's voice session, and without recovery the
+                // replacement would remain registered locally with no audio and
+                // no way to restore the voice session (Connection sees unchanged
+                // creds as already sent). So the guard is now based on voice
+                // credentials, not on a current track. The track is optional in
+                // the recovery data.
                 const afterDelete = this.riffy.players.get(player.guildId);
-                if (afterDelete && afterDelete !== player && afterDelete.current) {
-                    this.riffy.emit("debug", `[ResumeManager] Replacement player detected after orphan-cleanup DELETE for ${player.guildId}; re-sending its track + voice credentials to restore the Lavalink session.`);
+                const replConn = afterDelete?.connection;
+                const hasVoice = !!(replConn && replConn.voice && replConn.voice.sessionId && replConn.voice.endpoint && replConn.voice.token);
+                if (afterDelete && afterDelete !== player && hasVoice) {
+                    this.riffy.emit("debug", `[ResumeManager] Replacement player detected after orphan-cleanup DELETE for ${player.guildId}; re-sending its${afterDelete.current ? " track +" : ""} voice credentials to restore the Lavalink session.`);
                     try {
-                        const replEncoded = afterDelete.current.track || afterDelete.current.encoded;
-                        if (replEncoded) {
-                            // Build the recovery PATCH data with track + playback fields.
-                            const recoveryData = {
-                                track: { encoded: replEncoded },
-                                position: afterDelete.position || 0,
-                                volume: afterDelete.volume,
-                                paused: afterDelete.paused,
-                            };
-                            // Include voice credentials so Lavalink re-establishes
-                            // the voice session (the DELETE destroyed it). The
-                            // replacement's Connection won't re-send them on its own
-                            // because #lastSentVoice matches the current voice.
-                            const replConn = afterDelete.connection;
-                            if (replConn && replConn.voice && replConn.voice.sessionId && replConn.voice.endpoint && replConn.voice.token) {
-                                recoveryData.voice = {
-                                    sessionId: replConn.voice.sessionId,
-                                    endpoint: replConn.voice.endpoint,
-                                    token: replConn.voice.token,
-                                    channelId: replConn.voiceChannel ?? afterDelete.voiceChannel,
-                                };
+                        // Build the recovery PATCH data. Track + playback fields
+                        // are only included if the replacement has a current track.
+                        const recoveryData = {};
+                        if (afterDelete.current) {
+                            const replEncoded = afterDelete.current.track || afterDelete.current.encoded;
+                            if (replEncoded) {
+                                recoveryData.track = { encoded: replEncoded };
+                                recoveryData.position = afterDelete.position || 0;
+                                recoveryData.volume = afterDelete.volume;
+                                recoveryData.paused = afterDelete.paused;
                             }
-                            await afterDelete.node.rest.updatePlayer({
-                                guildId: player.guildId,
-                                data: recoveryData,
-                            });
                         }
+                        // Voice credentials are always included when present —
+                        // this is the critical part that restores the voice
+                        // session the DELETE just destroyed. The replacement's
+                        // Connection won't re-send them on its own because
+                        // #lastSentVoice matches the current voice.
+                        recoveryData.voice = {
+                            sessionId: replConn.voice.sessionId,
+                            endpoint: replConn.voice.endpoint,
+                            token: replConn.voice.token,
+                            channelId: replConn.voiceChannel ?? afterDelete.voiceChannel,
+                        };
+                        await afterDelete.node.rest.updatePlayer({
+                            guildId: player.guildId,
+                            data: recoveryData,
+                        });
                     } catch (e) {
                         this.riffy.emit("debug", `[ResumeManager] Re-PATCH of replacement failed for ${player.guildId}: ${e.message}`);
                     }
