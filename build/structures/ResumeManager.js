@@ -791,21 +791,45 @@ class ResumeManager {
                 // _failRestore emits the event, and createConnection →
                 // updatePlayer can land before this DELETE completes). The
                 // guild-scoped DELETE just killed the replacement's Lavalink
-                // session. Re-send the replacement's current track to restore it.
+                // session — including its voice session. Re-send the replacement's
+                // voice credentials AND track to fully restore the Lavalink session.
+                //
+                // RACE FIX 5: the replacement's Connection records the voice
+                // credentials as already sent (#lastSentVoice === current voice),
+                // so it would skip re-sending them on a normal updatePlayer. We
+                // must include the voice data explicitly in this recovery PATCH
+                // so Lavalink re-establishes the voice connection — otherwise the
+                // replacement has a track but no voice session and produces no
+                // audio.
                 const afterDelete = this.riffy.players.get(player.guildId);
                 if (afterDelete && afterDelete !== player && afterDelete.current) {
-                    this.riffy.emit("debug", `[ResumeManager] Replacement player detected after orphan-cleanup DELETE for ${player.guildId}; re-sending its track to restore the Lavalink session.`);
+                    this.riffy.emit("debug", `[ResumeManager] Replacement player detected after orphan-cleanup DELETE for ${player.guildId}; re-sending its track + voice credentials to restore the Lavalink session.`);
                     try {
                         const replEncoded = afterDelete.current.track || afterDelete.current.encoded;
                         if (replEncoded) {
+                            // Build the recovery PATCH data with track + playback fields.
+                            const recoveryData = {
+                                track: { encoded: replEncoded },
+                                position: afterDelete.position || 0,
+                                volume: afterDelete.volume,
+                                paused: afterDelete.paused,
+                            };
+                            // Include voice credentials so Lavalink re-establishes
+                            // the voice session (the DELETE destroyed it). The
+                            // replacement's Connection won't re-send them on its own
+                            // because #lastSentVoice matches the current voice.
+                            const replConn = afterDelete.connection;
+                            if (replConn && replConn.voice && replConn.voice.sessionId && replConn.voice.endpoint && replConn.voice.token) {
+                                recoveryData.voice = {
+                                    sessionId: replConn.voice.sessionId,
+                                    endpoint: replConn.voice.endpoint,
+                                    token: replConn.voice.token,
+                                    channelId: replConn.voiceChannel ?? afterDelete.voiceChannel,
+                                };
+                            }
                             await afterDelete.node.rest.updatePlayer({
                                 guildId: player.guildId,
-                                data: {
-                                    track: { encoded: replEncoded },
-                                    position: afterDelete.position || 0,
-                                    volume: afterDelete.volume,
-                                    paused: afterDelete.paused,
-                                },
+                                data: recoveryData,
                             });
                         }
                     } catch (e) {
