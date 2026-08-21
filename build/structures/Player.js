@@ -841,6 +841,9 @@ class Player extends EventEmitter {
             this.riffy.emit("debug", `[Player ${this.guildId}] restart(): no current track, starting next from queue.`);
             try {
                 await this.play();
+                // Emit playerResumed so listeners are notified (the current-track
+                // path emits it above; the queue-only path should too for symmetry).
+                this.riffy.emit("playerResumed", this);
             } catch (e) {
                 this.riffy.emit("debug", `[Player ${this.guildId}] restart(): play() failed: ${e.message}`);
             }

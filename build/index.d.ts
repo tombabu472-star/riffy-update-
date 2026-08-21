@@ -404,6 +404,14 @@ export declare class ResumeManager {
     public attachListeners(): void;
 
     /**
+     * Remove all event listeners and process handlers attached by
+     * attachListeners(). Also closes the storage adapter. Call this when
+     * replacing or disposing of a ResumeManager instance.
+     * @since 1.0.15
+     */
+    public destroy(): void;
+
+    /**
      * Clear all persisted state — both in-memory and the backing store.
      * Useful for testing or a manual reset.
      */

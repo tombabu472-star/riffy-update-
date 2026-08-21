@@ -87,6 +87,10 @@ class ResumeManager {
         this._saveTimers = new Map();
         /** @type {Promise<boolean> | null} load() promise (in-flight or null). */
         this._loadPromise = null;
+        /** @private Stored process signal handler refs so clear()/destroy() can unregister them. */
+        this._processHandlers = null;
+        /** @private Stored riffy event handler refs so destroy() can unregister them. */
+        this._riffyHandlers = null;
 
         /** @type {StorageAdapter} */
         this.storage = this._resolveStorage(options);
@@ -179,6 +183,14 @@ class ResumeManager {
         if (state.paused !== undefined && typeof state.paused !== "boolean") return { ok: false, reason: "paused is not a boolean" };
         if (state.queue !== undefined && !Array.isArray(state.queue)) return { ok: false, reason: "queue is not an array" };
         if (state.current !== undefined && state.current !== null && typeof state.current !== "object") return { ok: false, reason: "current is not an object" };
+        if (state.current && state.current.encoded !== undefined && state.current.encoded !== null && typeof state.current.encoded !== "string") return { ok: false, reason: "current.encoded is not a string" };
+        if (state.queue) {
+            for (let i = 0; i < state.queue.length; i++) {
+                const t = state.queue[i];
+                if (!t || typeof t !== "object") return { ok: false, reason: `queue[${i}] is not an object` };
+                if (t.encoded !== undefined && t.encoded !== null && typeof t.encoded !== "string") return { ok: false, reason: `queue[${i}].encoded is not a string` };
+            }
+        }
         return { ok: true };
     }
 
@@ -344,8 +356,11 @@ class ResumeManager {
      * Reconstruct a Track object from serialized data. Async because the
      * requesterResolver may return a Promise (e.g. client.users.fetch(id)).
      * @private
+     * @param {any} data Serialized track data.
+     * @param {any} node The Lavalink node to pass to the Track constructor.
+     * @param {string} [guildId] The guild being restored (for debug logging).
      */
-    async _rebuildTrack(data, node) {
+    async _rebuildTrack(data, node, guildId) {
         if (!data) return null;
         const encoded = data.encoded || null;
         let requester = data.info?.requester ?? null;
@@ -362,7 +377,7 @@ class ResumeManager {
                 }
             } catch (e) {
                 // Resolver threw (e.g. user not found) — keep primitive requester.
-                this.riffy.emit("debug", `[ResumeManager] requesterResolver threw for guild: ${e.message}`);
+                this.riffy.emit("debug", `[ResumeManager] requesterResolver threw for guild ${guildId ?? "?"}: ${e.message}`);
             }
         }
         const track = new Track(
@@ -501,80 +516,82 @@ class ResumeManager {
         // player (race condition flagged in review).
         let aborted = false;
         const isAborted = () => aborted;
-        const restorePromise = new Promise(async (resolve, reject) => {
-            // Register the reject so socketClosed / timeout can abort.
-            // Setting `aborted = true` first ensures the executor checks it.
-            this._pendingRestores.set(guildId, (reason, detail) => {
-                aborted = true;
-                reject({ reason, detail });
+
+        // Register the reject fn BEFORE creating the Promise so timeout /
+        // socketClosed can abort it. This avoids the `new Promise(async ...)`
+        // anti-pattern where errors in the executor's setup (e.g. Map.set
+        // throwing) would be swallowed and the Promise would never settle.
+        const rejectRef = { fn: null };
+        this._pendingRestores.set(guildId, (reason, detail) => {
+            aborted = true;
+            if (rejectRef.fn) rejectRef.fn({ reason, detail });
+        });
+
+        const runRestore = async () => {
+            // 1. Re-create the connection -> sends VOICE_STATE_UPDATE to rejoin.
+            const player = this.riffy.createConnection({
+                guildId,
+                voiceChannel: state.voiceChannel,
+                textChannel: state.textChannel,
+                deaf: state.deaf ?? true,
+                mute: state.mute ?? false,
+                defaultVolume: state.volume ?? 100,
+                loop: state.loop ?? "none",
             });
 
-            try {
-                // 1. Re-create the connection -> sends VOICE_STATE_UPDATE to rejoin.
-                const player = this.riffy.createConnection({
-                    guildId,
-                    voiceChannel: state.voiceChannel,
-                    textChannel: state.textChannel,
-                    deaf: state.deaf ?? true,
-                    mute: state.mute ?? false,
-                    defaultVolume: state.volume ?? 100,
-                    loop: state.loop ?? "none",
-                });
+            // 2. Restore volume & loop mode.
+            if (typeof state.volume === "number") player.volume = state.volume;
+            if (state.loop) player.loop = state.loop;
 
-                // 2. Restore volume & loop mode.
-                if (typeof state.volume === "number") player.volume = state.volume;
-                if (state.loop) player.loop = state.loop;
-
-                // 3. Rebuild the queue. Bail out if aborted mid-rebuild.
-                if (Array.isArray(state.queue) && !isAborted()) {
-                    for (const t of state.queue) {
-                        const rebuilt = await this._rebuildTrack(t, node);
-                        if (rebuilt) player.queue.add(rebuilt);
-                        if (isAborted()) break;
-                    }
+            // 3. Rebuild the queue. Bail out if aborted mid-rebuild.
+            if (Array.isArray(state.queue) && !isAborted()) {
+                for (const t of state.queue) {
+                    const rebuilt = await this._rebuildTrack(t, node, guildId);
+                    if (rebuilt) player.queue.add(rebuilt);
+                    if (isAborted()) break;
                 }
-
-                // 4. Restore current track + seek to the saved position.
-                if (!isAborted() && state.current && (state.current.encoded || (state.current.info && state.current.info.identifier))) {
-                    const currentTrack = await this._rebuildTrack(state.current, node);
-                    player.current = currentTrack;
-                    player.position = state.position || 0;
-                    player.paused = state.paused ?? false;
-
-                    // Send the resume payload once voice credentials arrive.
-                    // Pass isAborted so it can bail out if voice creds arrive
-                    // AFTER a timeout/socketClosed already aborted the restore.
-                    await this._sendResumePayload(player, state, isAborted);
-                } else if (!isAborted() && player.queue.length > 0) {
-                    // No current track but queue has items — start playback.
-                    // If this fails (e.g. voice init failed, track unresolvable),
-                    // the error MUST propagate so restorePlayer's catch block
-                    // calls _failRestore → destroys the player, removes it from
-                    // state, and emits playerRestoreFailed. Previously this catch
-                    // swallowed the error, leaving an unusable player registered
-                    // with no failure event (review: "Queue restore reports
-                    // false success").
-                    await player.play();
-                }
-
-                // If the restore was aborted while we were waiting, do NOT
-                // resolve — the promise has already been rejected, and the
-                // caller's catch block runs _failRestore. Resolving here would
-                // be a no-op (promise already settled), but we also must not
-                // emit the "Restored player" debug line.
-                if (isAborted()) {
-                    return;
-                }
-
-                this.riffy.emit(
-                    "debug",
-                    `[ResumeManager] Restored player for guild ${guildId} (voice=${state.voiceChannel}, queue=${player.queue.length}, position=${state.position || 0}ms, paused=${state.paused ?? false})`
-                );
-                resolve(player);
-            } catch (err) {
-                // If aborted, prefer the abort reason over this error.
-                if (!isAborted()) reject({ reason: "error", detail: err });
             }
+
+            // 4. Restore current track + seek to the saved position.
+            if (!isAborted() && state.current && (state.current.encoded || (state.current.info && state.current.info.identifier))) {
+                const currentTrack = await this._rebuildTrack(state.current, node, guildId);
+                player.current = currentTrack;
+                player.position = state.position || 0;
+                player.paused = state.paused ?? false;
+
+                // Send the resume payload once voice credentials arrive.
+                // Pass isAborted so it can bail out if voice creds arrive
+                // AFTER a timeout/socketClosed already aborted the restore.
+                await this._sendResumePayload(player, state, isAborted);
+            } else if (!isAborted() && player.queue.length > 0) {
+                // No current track but queue has items — start playback.
+                // If this fails (e.g. voice init failed, track unresolvable),
+                // the error MUST propagate so the .catch below calls
+                // _failRestore → destroys the player, removes it from state,
+                // and emits playerRestoreFailed.
+                await player.play();
+            }
+
+            // If the restore was aborted while we were waiting, do NOT
+            // emit the success debug line — the promise has already been
+            // rejected.
+            if (isAborted()) {
+                return null;
+            }
+
+            this.riffy.emit(
+                "debug",
+                `[ResumeManager] Restored player for guild ${guildId} (voice=${state.voiceChannel}, queue=${player.queue.length}, position=${state.position || 0}ms, paused=${state.paused ?? false})`
+            );
+            return player;
+        };
+
+        const restorePromise = new Promise((resolve, reject) => {
+            rejectRef.fn = reject;
+            runRestore().then(
+                (player) => { if (player) resolve(player); },
+                (err) => { if (!isAborted()) reject({ reason: "error", detail: err }); }
+            );
         });
 
         // Timeout: if voice credentials never arrive, abort.
@@ -869,6 +886,11 @@ class ResumeManager {
 
     /**
      * Attach event listeners to automatically persist state on player changes.
+     *
+     * Also registers process signal handlers (exit/SIGINT/SIGTERM) for a
+     * best-effort final flush. These handlers are stored so {@link destroy}
+     * can unregister them — important if the user re-creates ResumeManager
+     * (e.g. calling init() with different options after a hot reload).
      */
     attachListeners() {
         if (!this.enabled || this._listenersAttached) return;
@@ -876,23 +898,42 @@ class ResumeManager {
 
         const riffy = this.riffy;
 
-        riffy.on("trackStart", (player) => this.savePlayer(player));
-        riffy.on("trackEnd", (player) => this.savePlayer(player));
-        riffy.on("queueEnd", (player) => this.savePlayer(player));
-        riffy.on("playerCreate", (player) => this.savePlayer(player));
-        riffy.on("playerMove", (player) => this.savePlayer(player));
-        riffy.on("playerDestroy", (player) => this.removePlayer(player.guildId));
+        // Store riffy event handler refs so destroy() can unregister them.
+        const onTrackStart = (player) => this.savePlayer(player);
+        const onTrackEnd = (player) => this.savePlayer(player);
+        const onQueueEnd = (player) => this.savePlayer(player);
+        const onPlayerCreate = (player) => this.savePlayer(player);
+        const onPlayerMove = (player) => this.savePlayer(player);
+        const onPlayerDestroy = (player) => this.removePlayer(player.guildId);
+        const onPlayerUpdate = (player) => this.savePlayer(player);
 
-        // playerUpdate fires frequently (~every 5s) from Lavalink with the
-        // current position. Throttled via saveInterval (per-guild).
-        riffy.on("playerUpdate", (player) => this.savePlayer(player));
+        riffy.on("trackStart", onTrackStart);
+        riffy.on("trackEnd", onTrackEnd);
+        riffy.on("queueEnd", onQueueEnd);
+        riffy.on("playerCreate", onPlayerCreate);
+        riffy.on("playerMove", onPlayerMove);
+        riffy.on("playerDestroy", onPlayerDestroy);
+        riffy.on("playerUpdate", onPlayerUpdate);
 
-        // Best-effort final flush on process exit. Async I/O on process exit
-        // is unreliable (the event loop is torn down), so we prefer a sync
-        // saveSync() method if the adapter provides one (JsonFileStorage and
-        // ShardedJsonStorage do). For adapters that only have async save()
-        // (SqliteStorage, custom Redis/Postgres), we call it anyway as a last
-        // resort — it may not complete, but it's better than nothing.
+        this._riffyHandlers = [
+            ["trackStart", onTrackStart], ["trackEnd", onTrackEnd],
+            ["queueEnd", onQueueEnd], ["playerCreate", onPlayerCreate],
+            ["playerMove", onPlayerMove], ["playerDestroy", onPlayerDestroy],
+            ["playerUpdate", onPlayerUpdate],
+        ];
+
+        // Best-effort final flush on process exit. Sync saveSync() is used
+        // when available (JsonFileStorage, ShardedJsonStorage) because async
+        // I/O on process.exit is unreliable (the event loop is torn down).
+        //
+        // For adapters that only have async save() (SqliteStorage, custom
+        // Redis/Postgres), the SIGINT/SIGTERM handlers use a synchronous
+        // flush pattern (saveSync if available) and the async save() calls
+        // may not complete before the process exits. This is a known
+        // limitation — for production use with async-only adapters, consider
+        // implementing saveSync() or using a graceful shutdown pattern
+        // (calling await resumeManager.save() + await storage.close() in
+        // your own shutdown handler before process.exit()).
         const safeFlush = () => {
             try {
                 for (const [guildId, timer] of this._saveTimers) {
@@ -902,34 +943,93 @@ class ResumeManager {
                         if (typeof this.storage.saveSync === "function") {
                             this.storage.saveSync(guildId, state);
                         } else {
+                            // Async-only adapter — fire and forget. May not
+                            // complete on unclean shutdown (documented above).
                             this.storage.save(guildId, state).catch(() => {});
                         }
                     }
                 }
                 this._saveTimers.clear();
+                // Close the storage adapter to release resources (e.g. the
+                // SQLite database handle). Safe to call even if close() is
+                // a no-op (JsonFileStorage / ShardedJsonStorage).
+                if (typeof this.storage.close === "function") {
+                    this.storage.close().catch(() => {});
+                }
             } catch (_) {
                 /* ignore */
             }
         };
-        process.on("exit", safeFlush);
-        process.on("SIGINT", () => {
-            safeFlush();
-            process.exit(0);
-        });
-        process.on("SIGTERM", () => {
-            safeFlush();
-            process.exit(0);
-        });
+
+        const onExit = safeFlush;
+        const onSIGINT = () => { safeFlush(); process.exit(0); };
+        const onSIGTERM = () => { safeFlush(); process.exit(0); };
+
+        process.on("exit", onExit);
+        process.on("SIGINT", onSIGINT);
+        process.on("SIGTERM", onSIGTERM);
+
+        this._processHandlers = { onExit, onSIGINT, onSIGTERM };
+    }
+
+    /**
+     * Remove all event listeners and process handlers attached by
+     * {@link attachListeners}. Also closes the storage adapter (releasing
+     * resources like the SQLite database handle) and clears all pending
+     * per-guild save timers.
+     *
+     * Call this when replacing or disposing of a ResumeManager instance
+     * (e.g. in tests, or if the user calls init() again with different
+     * options). Without this, stale closures remain on the riffy
+     * EventEmitter and on process, keeping the old instance alive and
+     * causing duplicate handler invocations.
+     *
+     * @since 1.0.15
+     */
+    destroy() {
+        // Remove riffy event listeners.
+        if (this._riffyHandlers) {
+            for (const [event, handler] of this._riffyHandlers) {
+                this.riffy.off(event, handler);
+            }
+            this._riffyHandlers = null;
+        }
+        // Remove process signal handlers.
+        if (this._processHandlers) {
+            const { onExit, onSIGINT, onSIGTERM } = this._processHandlers;
+            process.off("exit", onExit);
+            process.off("SIGINT", onSIGINT);
+            process.off("SIGTERM", onSIGTERM);
+            this._processHandlers = null;
+        }
+        // Clear pending save timers.
+        for (const timer of this._saveTimers.values()) clearTimeout(timer);
+        this._saveTimers.clear();
+        // Close the storage adapter (releases DB handles etc).
+        if (this.storage && typeof this.storage.close === "function") {
+            this.storage.close().catch(() => {});
+        }
+        this._listenersAttached = false;
     }
 
     /**
      * Clear all persisted state — both in-memory and the backing store.
-     * Useful for testing or a manual reset.
+     * Also removes process signal handlers (so stale handlers don't
+     * accumulate if clear() is called before re-init). Useful for testing
+     * or a manual reset.
      */
     async clear() {
         this._state = { version: 1, savedAt: 0, players: {} };
         for (const t of this._saveTimers.values()) clearTimeout(t);
         this._saveTimers.clear();
+        // Remove process signal handlers to prevent accumulation.
+        if (this._processHandlers) {
+            const { onExit, onSIGINT, onSIGTERM } = this._processHandlers;
+            process.off("exit", onExit);
+            process.off("SIGINT", onSIGINT);
+            process.off("SIGTERM", onSIGTERM);
+            this._processHandlers = null;
+        }
         await this.storage.clear().catch(() => {});
     }
 
