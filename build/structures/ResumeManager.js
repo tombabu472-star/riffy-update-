@@ -705,9 +705,15 @@ class ResumeManager {
         }
 
         // Remove from persisted state so it isn't retried on every restart.
+        // Note: player.destroy(true) above emits playerDisconnect → the
+        // attachListeners hook already called removePlayer(guildId) which
+        // deletes from _state.players + calls storage.remove(). This block
+        // is a safety net for the case where the hook isn't attached (e.g.
+        // attachListeners wasn't called, or destroy() didn't emit the event).
+        // The guard prevents a redundant storage.remove() call when
+        // clearOnRestore would wipe everything anyway.
         if (this._state.players[guildId]) {
             delete this._state.players[guildId];
-            // Persist the cleanup immediately (unless clearOnRestore will wipe all).
             if (!this.clearOnRestore) {
                 this.storage.remove(guildId).catch((err) => {
                     this.riffy.emit("debug", `[ResumeManager] storage.remove failed for ${guildId} after failed restore: ${err.message}`);
@@ -781,8 +787,12 @@ class ResumeManager {
 
         const encoded = state.current?.encoded || player.current?.track || player.current?.encoded;
         if (!encoded) {
-            this.riffy.emit("debug", `[ResumeManager] No encoded track to resume for ${player.guildId}`);
-            return;
+            // No encoded track to resume — throw so restorePlayer's catch
+            // calls _failRestore (destroys the player, emits
+            // playerRestoreFailed) instead of falling through to
+            // resolve(player) + emit playerResumed, which would be a false
+            // success (bot rejoins voice channel but produces no audio).
+            throw new Error(`No encoded track to resume for ${player.guildId}`);
         }
 
         await player.node.rest.updatePlayer({
@@ -922,8 +932,19 @@ class ResumeManager {
         // Store riffy event handler refs so destroy() can unregister them.
         const onTrackStart = (player) => this.savePlayer(player);
         const onTrackEnd = (player) => this.savePlayer(player);
-        const onQueueEnd = (player) => this.savePlayer(player);
-        const onPlayerCreate = (player) => this.savePlayer(player);
+        // queueEnd: the queue is empty + nothing playing. Persisting this idle
+        // state (current: null, queue: []) means on restart the bot rejoins the
+        // voice channel and sits idle — playerResumed fires but no audio plays.
+        // Instead, remove the guild from the store so it's NOT restored.
+        const onQueueEnd = (player) => this.removePlayer(player.guildId);
+        // playerCreate: only save if there's something worth restoring (a
+        // current track or a non-empty queue). A freshly created player with
+        // no track + empty queue isn't worth persisting.
+        const onPlayerCreate = (player) => {
+            if (player.current || (player.queue && player.queue.length > 0)) {
+                this.savePlayer(player);
+            }
+        };
         const onPlayerMove = (player) => this.savePlayer(player);
         // Hook playerDisconnect (emitted by Player.destroy()) instead of just
         // playerDestroy (only emitted by Riffy.destroyPlayer()). If a user or

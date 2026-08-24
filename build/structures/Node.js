@@ -627,7 +627,12 @@ class Node {
     if (this.autoResume) {
       for (const player of this.riffy.players.values()) {
         if (player.node === this) {
-          player.restart();
+          // restart() is async and can reject (connection.resolve() timeout,
+          // REST updatePlayer failure). Without .catch(), the rejection is
+          // unhandled and crashes the process on Node 15+.
+          player.restart().catch((err) => {
+            this.riffy.emit("debug", `[Node: ${this.name}] autoResume restart failed for ${player.guildId}: ${err.message}`);
+          });
         }
       }
     }
@@ -687,7 +692,7 @@ class Node {
   }
 
   async close(event, reason, ...args) {
-  	reason = reason.toString();
+        reason = reason.toString();
     this.riffy.emit("nodeDisconnect", this, { code: event, reason: reason });
     this.riffy.emit("debug", `Connection with Lavalink closed with Error code : ${event || "Unknown code"}, reason: ${reason || "Unknown reason"}`);
 
