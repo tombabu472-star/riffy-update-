@@ -789,7 +789,18 @@ class Node {
     if (!this.connected) return;
     // bestNode is a getter property (not a function). Calling it as
     // bestNode() throws TypeError. Use it as a property instead.
-    this.riffy.players.forEach((player) => { if (player.node == this) { this.riffy.bestNode ? player.moveTo(this.riffy.bestNode) : true } });
+    // moveTo() is async — add .catch() to prevent unhandled rejection
+    // crashes on Node.js 15+ if the move fails (REST error, voice
+    // credential timeout on the target node, etc.).
+    this.riffy.players.forEach((player) => {
+      if (player.node == this) {
+        if (this.riffy.bestNode) {
+          player.moveTo(this.riffy.bestNode).catch((err) => {
+            this.riffy.emit("debug", `[Node: ${this.name}] disconnect() moveTo failed for ${player.guildId}: ${err.message}`);
+          });
+        }
+      }
+    });
     this.ws.close(1000, "destroy");
     this.ws?.removeAllListeners();
     this.ws = null;
