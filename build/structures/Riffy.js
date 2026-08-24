@@ -159,9 +159,9 @@ class Riffy extends EventEmitter {
   destroyNode(identifier) {
     const node = this.nodeMap.get(identifier);
     if (!node) return;
+    // node.destroy() already emits "nodeDestroy" and deletes from nodeMap,
+    // so we don't duplicate them here (was double-emitting nodeDestroy).
     node.destroy();
-    this.nodeMap.delete(identifier);
-    this.emit("nodeDestroy", node);
   }
 
   /**
