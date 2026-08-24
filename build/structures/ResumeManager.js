@@ -561,7 +561,13 @@ class ResumeManager {
             }
 
             // 4. Restore current track + seek to the saved position.
-            if (!isAborted() && state.current && (state.current.encoded || (state.current.info && state.current.info.identifier))) {
+            // Only enter this path when we have an encoded track string —
+            // the Lavalink seek PATCH requires it. A saved state with only
+            // info.identifier (no encoded) cannot be resumed via Lavalink,
+            // so we fall through to the queue-only path instead. This
+            // prevents false success where playerResumed fires but no audio
+            // plays (bot sits in voice channel with nothing loaded).
+            if (!isAborted() && state.current && state.current.encoded) {
                 const currentTrack = await this._rebuildTrack(state.current, node, guildId);
                 player.current = currentTrack;
                 player.position = state.position || 0;
@@ -578,6 +584,14 @@ class ResumeManager {
                 // _failRestore → destroys the player, removes it from state,
                 // and emits playerRestoreFailed.
                 await player.play();
+            } else {
+                // No encoded current track AND empty queue — the player was
+                // created but has nothing to play. This is an idle restore:
+                // the bot rejoined the voice channel but won't produce audio.
+                // Do NOT emit playerResumed (false success) — return null so
+                // restoreAll doesn't count it as a successful restore.
+                this.riffy.emit("debug", `[ResumeManager] Restored player for guild ${guildId} is idle (no current track, empty queue) — not emitting playerResumed.`);
+                return null;
             }
 
             // If the restore was aborted while we were waiting, do NOT

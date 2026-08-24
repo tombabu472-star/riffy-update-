@@ -763,7 +763,12 @@ class Node {
     this.riffy.players.forEach((player) => {
       if (player.node !== this) return;
 
-      player.destroy()
+      // Delegate through riffy.destroyPlayer() so BOTH events fire:
+      // playerDisconnect (from player.destroy()) AND playerDestroy (from
+      // riffy.destroyPlayer). Without this, user code hooking playerDestroy
+      // for cleanup (text channel notifications, analytics, etc.) would
+      // silently not fire when a node is destroyed.
+      this.riffy.destroyPlayer(player.guildId);
     });
 
     if (this.ws) this.ws.close(1000, "destroy");
