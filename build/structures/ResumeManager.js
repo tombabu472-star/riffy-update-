@@ -543,12 +543,20 @@ class ResumeManager {
             if (typeof state.volume === "number") player.volume = state.volume;
             if (state.loop) player.loop = state.loop;
 
-            // 3. Rebuild the queue. Bail out if aborted mid-rebuild.
+            // 3. Rebuild the queue. Use a bounded-concurrency batch pattern so
+            // an async requesterResolver (e.g. client.users.fetch) doesn't
+            // serialize N network calls. Aborts are checked between batches.
             if (Array.isArray(state.queue) && !isAborted()) {
-                for (const t of state.queue) {
-                    const rebuilt = await this._rebuildTrack(t, node, guildId);
-                    if (rebuilt) player.queue.add(rebuilt);
+                const BATCH_SIZE = 10;
+                for (let i = 0; i < state.queue.length; i += BATCH_SIZE) {
                     if (isAborted()) break;
+                    const batch = state.queue.slice(i, i + BATCH_SIZE);
+                    const rebuiltTracks = await Promise.all(
+                        batch.map((t) => isAborted() ? null : this._rebuildTrack(t, node, guildId))
+                    );
+                    for (const rebuilt of rebuiltTracks) {
+                        if (rebuilt) player.queue.add(rebuilt);
+                    }
                 }
             }
 
@@ -619,6 +627,15 @@ class ResumeManager {
                 }
             }
         };
+        // Bump the maxListeners limit before adding a concurrent socketClosed
+        // listener. With restoreConcurrency=8 (default), up to 8 listeners are
+        // registered simultaneously. Node's default EventEmitter limit is 10,
+        // so any bot with other socketClosed listeners would hit
+        // MaxListenersExceededWarning. We restore the limit in the finally block.
+        const prevMaxListeners = this.riffy.getMaxListeners();
+        if (prevMaxListeners !== 0) { // 0 = unlimited, no need to bump
+            this.riffy.setMaxListeners(prevMaxListeners + 1);
+        }
         this.riffy.on("socketClosed", socketClosedHandler);
 
         try {
@@ -633,6 +650,10 @@ class ResumeManager {
             clearTimeout(settleTimer);
             this._pendingRestores.delete(guildId);
             if (socketClosedHandler) this.riffy.off("socketClosed", socketClosedHandler);
+            // Restore the maxListeners limit we bumped above.
+            if (prevMaxListeners !== 0) {
+                this.riffy.setMaxListeners(Math.max(0, this.riffy.getMaxListeners() - 1));
+            }
         }
     }
 
@@ -904,6 +925,13 @@ class ResumeManager {
         const onQueueEnd = (player) => this.savePlayer(player);
         const onPlayerCreate = (player) => this.savePlayer(player);
         const onPlayerMove = (player) => this.savePlayer(player);
+        // Hook playerDisconnect (emitted by Player.destroy()) instead of just
+        // playerDestroy (only emitted by Riffy.destroyPlayer()). If a user or
+        // internal code calls player.destroy() directly, playerDisconnect
+        // still fires, so we clean up persisted state. Without this, a
+        // directly-destroyed player's state stays in the store and gets
+        // re-restored on the next restart — resurrecting a killed player.
+        const onPlayerDisconnect = (player) => this.removePlayer(player.guildId);
         const onPlayerDestroy = (player) => this.removePlayer(player.guildId);
         const onPlayerUpdate = (player) => this.savePlayer(player);
 
@@ -912,14 +940,15 @@ class ResumeManager {
         riffy.on("queueEnd", onQueueEnd);
         riffy.on("playerCreate", onPlayerCreate);
         riffy.on("playerMove", onPlayerMove);
+        riffy.on("playerDisconnect", onPlayerDisconnect);
         riffy.on("playerDestroy", onPlayerDestroy);
         riffy.on("playerUpdate", onPlayerUpdate);
 
         this._riffyHandlers = [
             ["trackStart", onTrackStart], ["trackEnd", onTrackEnd],
             ["queueEnd", onQueueEnd], ["playerCreate", onPlayerCreate],
-            ["playerMove", onPlayerMove], ["playerDestroy", onPlayerDestroy],
-            ["playerUpdate", onPlayerUpdate],
+            ["playerMove", onPlayerMove], ["playerDisconnect", onPlayerDisconnect],
+            ["playerDestroy", onPlayerDestroy], ["playerUpdate", onPlayerUpdate],
         ];
 
         // Best-effort final flush on process exit. Sync saveSync() is used
