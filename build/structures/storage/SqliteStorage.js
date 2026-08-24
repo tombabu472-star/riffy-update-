@@ -92,15 +92,22 @@ class SqliteStorage extends StorageAdapter {
     }
 
     async save(guildId, state) {
+        // Guard: init() may not have completed yet (Riffy.init() calls
+        // load() without await, and attachListeners() arms immediately).
+        // If a player event fires + saveInterval is very short, the
+        // debounced save can fire before init() resolves → TypeError.
+        if (!this._stmtUpsert) return;
         // better-sqlite3 is synchronous; wrap in Promise.resolve for contract.
         this._stmtUpsert.run(guildId, JSON.stringify(state), Date.now());
     }
 
     async remove(guildId) {
+        if (!this._stmtDelete) return;
         this._stmtDelete.run(guildId);
     }
 
     async clear() {
+        if (!this._stmtClear) return;
         this._stmtClear.run();
     }
 

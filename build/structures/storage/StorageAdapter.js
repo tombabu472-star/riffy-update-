@@ -50,6 +50,15 @@ class StorageAdapter {
      * — called on every player event (debounced by ResumeManager per guild).
      * Must be idempotent and atomic for the single guild.
      *
+     * WARNING: The process-exit signal handler (SIGINT/SIGTERM) calls save()
+     * (or saveSync() if available) for a best-effort final flush. Custom
+     * adapters with genuinely async save() (network I/O like Redis,
+     * PostgreSQL, MongoDB) cannot guarantee a complete flush on unclean
+     * shutdown — process.exit(0) kills the process before the Promise
+     * resolves. Implement saveSync() for the flush path, or use a graceful
+     * shutdown pattern (await resumeManager.save() + await storage.close()
+     * in your own shutdown handler before calling process.exit()).
+     *
      * @param {string} guildId
      * @param {any} state The serialized player state (already JSON-safe).
      * @returns {Promise<void>}

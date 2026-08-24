@@ -347,8 +347,17 @@ class Riffy extends EventEmitter {
   }
 
   removeConnection(guildId) {
-    this.players.get(guildId)?.destroy();
-    this.players.delete(guildId);
+    // Delegate through destroyPlayer() so that:
+    //   1. The playerDestroy event fires (for backward compat with code that
+    //      hooks it directly).
+    //   2. The resume state cleanup hook (playerDisconnect/playerDestroy →
+    //      resumeManager.removePlayer) fires — otherwise the guild's state
+    //      stays in the store and gets silently re-restored on the next
+    //      restart, resurrecting a player the user intentionally removed.
+    // Previously this called player.destroy() directly + players.delete()
+    // (redundant — destroy() already deletes from the map), bypassing the
+    // cleanup event.
+    this.destroyPlayer(guildId);
   }
 
   /**
