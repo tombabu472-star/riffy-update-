@@ -75,6 +75,21 @@ client.riffy.on("playerRestoreFailed", (guildId, reason, detail, state) => {
 });
 ```
 
+### What gets restored?
+
+| Field | Restored? | Notes |
+|-------|-----------|-------|
+| Voice channel | ✅ | Bot rejoins the same voice channel |
+| Current track | ✅ | Re-sent to Lavalink at the exact saved position (seek) |
+| Playback position | ✅ | Seeked to the millisecond |
+| **Paused state** | ✅ | If the player was paused before the restart, it stays paused — the bot doesn't surprise users by suddenly playing audio they paused |
+| Volume | ✅ | Restored to the saved value |
+| Loop mode | ✅ | `none`, `track`, or `queue` |
+| Queue | ✅ | Rebuilt from persisted encoded track strings (capped by `maxQueueSize`) |
+| Deaf/Mute | ✅ | Self-deaf/self-mute state restored |
+
+The `paused` state is saved as part of `serializePlayer()` and sent to Lavalink via `updatePlayer({ paused: state.paused })` during restore. So a paused player rejoins paused — it will NOT auto-play unless the user explicitly resumes it.
+
 ---
 
 ## New API
