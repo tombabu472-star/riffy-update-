@@ -343,6 +343,13 @@ export declare class ResumeManager {
      */
     public restoreConcurrency: number;
     /**
+     * Optional filter for sharded bots — returns true if the guild belongs
+     * to this shard. Guilds returning false are skipped (not restored, not
+     * deleted) so other shards can still restore them.
+     * @since 1.0.15
+     */
+    public guildFilter: ((guildId: string) => boolean) | null;
+    /**
      * The active storage adapter.
      * @since 1.0.15
      */
@@ -760,6 +767,23 @@ export type ResumeOptions = {
      * @since 1.0.15
      */
     restoreConcurrency?: number;
+    /**
+     * Filter function for sharded bots. Returns true if the guild belongs
+     * to THIS shard/process (and should be restored). Guilds returning
+     * false are SKIPPED — not restored, not deleted — so other shards
+     * can still restore them.
+     *
+     * Without this, every shard loads ALL guilds, fails to restore guilds
+     * it doesn't manage (no voice credentials), and deletes them —
+     * destroying data for other shards.
+     *
+     * Example (discord.js):
+     *   guildFilter: (guildId) => client.guilds.cache.has(guildId)
+     *
+     * Default: `null` (no filtering — restore all guilds).
+     * @since 1.0.15
+     */
+    guildFilter?: (guildId: string) => boolean;
     /**
      * Storage backend. Accepts:
      *   - `"json"` — single JSON file (default; fine for <~100 players)

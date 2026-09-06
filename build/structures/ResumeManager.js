@@ -58,6 +58,32 @@ class ResumeManager {
         this.clearOnRestore = options.clearOnRestore ?? false;
         this.restoreTimeout = typeof options.restoreTimeout === "number" ? options.restoreTimeout : 15000;
         /**
+         * Optional filter function for sharded bots. Returns true if the
+         * guild belongs to THIS shard/process (and should be restored).
+         * Guilds that return false are SKIPPED — not restored, not deleted
+         * from the store — so other shards can still restore them.
+         *
+         * Without this, every shard loads ALL guilds from the shared state
+         * file, tries to restore guilds it doesn't manage, fails (no voice
+         * credentials), and deletes them from the store — destroying data
+         * that belongs to other shards.
+         *
+         * Example (discord.js):
+         *   guildFilter: (guildId) => client.guilds.cache.has(guildId)
+         *
+         * Or with explicit shard calculation:
+         *   guildFilter: (guildId) => {
+         *     const shardId = (BigInt(guildId) >> 22n) % BigInt(totalShards);
+         *     return client.shard.ids.includes(Number(shardId));
+         *   }
+         *
+         * Default: `null` (no filtering — restore all guilds, for
+         * non-sharded bots).
+         *
+         * @since 1.0.15
+         */
+        this.guildFilter = typeof options.guildFilter === "function" ? options.guildFilter : null;
+        /**
          * Max number of queue tracks to persist per guild. A bot in a guild
          * where someone queued a 500-track playlist would otherwise bloat
          * storage; capping prevents that. `null` = no limit.
@@ -417,8 +443,8 @@ class ResumeManager {
             try { await this._loadPromise; } catch (_) { /* already logged */ }
         }
 
-        const guildIds = Object.keys(this._state.players || {});
-        if (!guildIds.length) {
+        const allGuildIds = Object.keys(this._state.players || {});
+        if (!allGuildIds.length) {
             this.riffy.emit("debug", `[ResumeManager] No saved players to restore.`);
             if (this.clearOnRestore) {
                 await this.storage.clear().catch(() => {});
@@ -427,7 +453,36 @@ class ResumeManager {
             return [];
         }
 
-        this.riffy.emit("debug", `[ResumeManager] Restoring ${guildIds.length} player(s) (concurrency=${this.restoreConcurrency})...`);
+        // Filter guilds for sharded bots: only restore guilds that belong to
+        // THIS shard/process. Guilds on other shards are SKIPPED (not
+        // restored, not deleted) so they survive for the correct shard to
+        // pick up. Without this, every shard would try to restore ALL guilds,
+        // fail for guilds it doesn't manage (no voice credentials), and
+        // delete them from the store — destroying data for other shards.
+        let guildIds = allGuildIds;
+        let skippedCount = 0;
+        if (this.guildFilter) {
+            guildIds = allGuildIds.filter((gid) => {
+                try {
+                    const belongs = this.guildFilter(gid);
+                    if (!belongs) {
+                        skippedCount++;
+                        this.riffy.emit("debug", `[ResumeManager] Skipping guild ${gid} (not managed by this shard/process).`);
+                    }
+                    return belongs;
+                } catch (e) {
+                    this.riffy.emit("debug", `[ResumeManager] guildFilter threw for ${gid}: ${e.message} — including guild.`);
+                    return true; // on error, include the guild (safer than skipping)
+                }
+            });
+        }
+        if (!guildIds.length) {
+            this.riffy.emit("debug", `[ResumeManager] No guilds to restore on this shard (${skippedCount} skipped, belong to other shards).`);
+            // Do NOT clear the store — other shards still need it.
+            return [];
+        }
+
+        this.riffy.emit("debug", `[ResumeManager] Restoring ${guildIds.length} player(s)${skippedCount ? ` (${skippedCount} skipped — other shards)` : ""} (concurrency=${this.restoreConcurrency})...`);
         const restored = [];
 
         // Restore players concurrently with a bounded concurrency limit so a
@@ -460,14 +515,26 @@ class ResumeManager {
         this.riffy.emit("debug", `[ResumeManager] Restore complete (${restored.length}/${guildIds.length} succeeded).`);
 
         if (this.clearOnRestore) {
-            // Wipe in-memory state and clear the store so it isn't re-applied
-            // on the next restart. Fresh state is written as new activity happens.
-            this._state = { version: 1, savedAt: 0, players: {} };
-            for (const t of this._saveTimers.values()) clearTimeout(t);
-            this._saveTimers.clear();
-            await this.storage.clear().catch(() => {});
+            // Wipe in-memory state so it isn't re-applied on the next restart.
+            // Fresh state is written as new activity happens.
+            if (this.guildFilter) {
+                // Sharded mode: only remove THIS shard's guilds from the
+                // store — NOT a full clear (other shards still need their
+                // guilds). Remove each restored/skipped guild individually.
+                for (const gid of guildIds) {
+                    this.storage.remove(gid).catch(() => {});
+                    delete this._state.players[gid];
+                }
+                this.riffy.emit("debug", `[ResumeManager] clearOnRestore enabled (sharded mode) — removed ${guildIds.length} guild(s) for this shard, other shards' data preserved.`);
+            } else {
+                // Non-sharded: wipe everything.
+                this._state = { version: 1, savedAt: 0, players: {} };
+                for (const t of this._saveTimers.values()) clearTimeout(t);
+                this._saveTimers.clear();
+                await this.storage.clear().catch(() => {});
+                this.riffy.emit("debug", `[ResumeManager] clearOnRestore enabled — store cleared, in-memory state wiped.`);
+            }
             this._restoredFully = true;
-            this.riffy.emit("debug", `[ResumeManager] clearOnRestore enabled — store cleared, in-memory state wiped.`);
         }
 
         return restored;
