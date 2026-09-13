@@ -803,7 +803,11 @@ class Player extends EventEmitter {
             mute: this.mute,
         });
 
-        if (this.current && (this.current.track || this.current.encoded)) {
+        // Only resume if the player was actively playing or paused — NOT if
+        // it was stopped (current is retained after stop()/queueEnd/trackError
+        // while playing=false and paused=false). Without this guard, a reconnect
+        // would replay a deliberately stopped or already-finished track.
+        if (this.current && (this.current.track || this.current.encoded) && (this.playing || this.paused)) {
             try {
                 await this.connection.resolve();
             } catch (e) {

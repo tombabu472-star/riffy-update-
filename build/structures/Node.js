@@ -755,15 +755,21 @@ class Node {
       return;
     }
 
-    if (!this.connected) return;
+    // If already disconnected (e.g. after disconnect()), we still need to
+    // perform cleanup: close ws, clear reconnect timers, emit nodeDestroy,
+    // and delete from nodeMap. Without this, destroyNode() after disconnect()
+    // silently leaves the node registered.
+    // Player cleanup is only done if we were connected (disconnect() already
+    // migrated or destroyed players).
+    if (this.connected) {
+      this.riffy.players.forEach((player) => {
+        if (player.node !== this) return;
 
-    this.riffy.players.forEach((player) => {
-      if (player.node !== this) return;
+        this.riffy.destroyPlayer(player.guildId);
+      });
+    }
 
-      this.riffy.destroyPlayer(player.guildId);
-    });
-
-    if (this.ws) this.ws.close(1000, "destroy");
+    this.ws?.close(1000, "destroy");
     this.ws?.removeAllListeners();
     this.ws = null;
 
@@ -795,13 +801,12 @@ class Node {
         }
       }
     });
-    this.ws.close(1000, "destroy");
+    this.ws?.close(1000, "destroy");
     this.ws?.removeAllListeners();
     this.ws = null;
     // Allowing to connect back.
     // this.riffy.nodeMap.delete(this.name);
     this.riffy.emit("nodeDisconnect", this);
-    this.connected = false;
   }
 
   get penalties() {
