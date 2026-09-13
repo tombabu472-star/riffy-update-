@@ -790,12 +790,14 @@ class Node {
 
   disconnect() {
     if (!this.connected) return;
-    // Mark as disconnected FIRST so bestNode won't select this node as a
-    // migration target (bestNode filters by node.connected).
-    this.connected = false;
+    // Find a destination node BEFORE setting connected=false, because
+    // Player.moveTo() only calls oldNode.rest.destroyPlayer() when
+    // oldNode.connected is true. If we set connected=false first, the
+    // old Lavalink player isn't deleted — leaving an orphan on the
+    // disconnecting node. We set connected=false AFTER migration.
     this.riffy.players.forEach((player) => {
       if (player.node == this) {
-        // Find a destination node that is NOT this one (which is disconnecting).
+        // Find a destination node that is NOT this one.
         const dest = [...this.riffy.nodeMap.values()]
           .filter(n => n.connected && n !== this)
           .sort((a, b) => a.penalties - b.penalties)[0];
@@ -806,9 +808,15 @@ class Node {
         }
       }
     });
+    // Now safe to mark as disconnected — moveTo() has already had a chance
+    // to destroy the old Lavalink player via oldNode.rest.destroyPlayer().
     this.ws?.close(1000, "destroy");
     this.ws?.removeAllListeners();
     this.ws = null;
+    // Now mark as disconnected — after moveTo() has had a chance to
+    // destroy the old Lavalink player (which requires oldNode.connected
+    // to be true).
+    this.connected = false;
     // Allowing to connect back.
     // this.riffy.nodeMap.delete(this.name);
     this.riffy.emit("nodeDisconnect", this);
