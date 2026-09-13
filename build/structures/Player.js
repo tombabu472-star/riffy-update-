@@ -845,13 +845,15 @@ class Player extends EventEmitter {
 
             this.riffy.emit("debug", `[Player ${this.guildId}] restart(): resumed "${this.current.info?.title || "Unknown"}" at ${this.position || 0}ms (paused=${this.paused}).`);
             this.riffy.emit("playerResumed", this);
-        } else if (this.queue.length > 0) {
+        } else if (!this.current && this.queue.length > 0) {
+            // Only start from the queue if there is genuinely NO current track.
+            // stop() sets playing=false and paused=false but intentionally
+            // leaves current + queue intact. Without the !this.current guard,
+            // a reconnect after stop() would start the next queued track
+            // despite the user having deliberately stopped playback.
             this.riffy.emit("debug", `[Player ${this.guildId}] restart(): no current track, starting next from queue.`);
             try {
                 await this.play();
-                // Only emit playerResumed if playback actually started — if all
-                // tracks failed resolution, play() returns with playing=false
-                // and emitting playerResumed would be a false success.
                 if (this.playing) {
                     this.riffy.emit("playerResumed", this);
                 }
@@ -859,7 +861,7 @@ class Player extends EventEmitter {
                 this.riffy.emit("debug", `[Player ${this.guildId}] restart(): play() failed: ${e.message}`);
             }
         } else {
-            this.riffy.emit("debug", `[Player ${this.guildId}] restart(): no current track and empty queue, nothing to resume.`);
+            this.riffy.emit("debug", `[Player ${this.guildId}] restart(): nothing to resume (stopped or empty).`);
         }
 
         return this;

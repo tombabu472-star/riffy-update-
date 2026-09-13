@@ -746,6 +746,14 @@ class Node {
    */
   destroy(clean = false) {
     if (clean) {
+      // Even on terminal/clean destroy, clean up associated players —
+      // close()/disconnect() may have failed to migrate them, leaving
+      // orphaned players in riffy.players pointing at this node.
+      this.riffy.players.forEach((player) => {
+        if (player.node !== this) return;
+
+        this.riffy.destroyPlayer(player.guildId);
+      });
       if (this.ws) this.ws?.close(1000, "Clean Destroy");
       this.ws?.removeAllListeners();
       this.ws = null;
