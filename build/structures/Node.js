@@ -723,7 +723,13 @@ class Node {
     this.riffy.emit("nodeDisconnect", this, { code: event, reason: reason });
     this.riffy.emit("debug", `Connection with Lavalink closed with Error code : ${event || "Unknown code"}, reason: ${reason || "Unknown reason"}`);
 
-    this.connected = false;
+    // Defer setting connected=false until AFTER migration completes.
+    // Player.moveTo() uses oldNode.rest.destroyPlayer() to clean up the old
+    // Lavalink player — but only when it considers the old node "connected"
+    // enough to have a valid REST endpoint. More importantly, moveTo() now
+    // ALWAYS attempts deletion with .catch(), so this ordering is less
+    // critical, but keeping connected=true during migration ensures
+    // leastUsedNodes/bestNode don't select this node mid-migration.
     if (this.riffy.migrateOnDisconnect) {
       try {
         await this.riffy.migrate(this);
@@ -731,6 +737,8 @@ class Node {
         this.riffy.emit("debug", `Failed to auto-migrate players from node ${this.name} on disconnect: ${err.message}`);
       }
     }
+    // NOW safe to mark as disconnected — migration is complete.
+    this.connected = false;
     this.reconnect();
   }
 
