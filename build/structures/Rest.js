@@ -40,6 +40,13 @@ class Rest {
       return this.makeRequest(method, endpoint, body, includeHeaders, retryCount + 1);
     }
 
+    // Reject on non-2xx responses (4xx) — previously, a 400/404 would resolve
+    // normally and callers would treat the update as successful. This caused
+    // playerResumed to fire even though Lavalink rejected the update.
+    if (!response.ok) {
+      throw new Error(`REST ${method} ${endpoint} failed with status ${response.status} (${response.statusText})`);
+    }
+
     // Parses The Request
     const data = await this.parseResponse(response);
 

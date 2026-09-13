@@ -596,7 +596,15 @@ class Node {
     }
 
     this.ws = new Websocket(this.wsUrl, { headers });
-    this.ws.on("open", this.open.bind(this));
+    // Wrap open() in a catch — it's async and can throw (fetchInfo fails,
+    // info missing). WebSocket doesn't await or catch the handler's promise,
+    // so an unhandled rejection would crash the process on Node 15+.
+    this.ws.on("open", () => {
+      this.open().catch((err) => {
+        this.riffy.emit("debug", `[Node: ${this.name}] open() failed: ${err.message}`);
+        this.riffy.emit("nodeError", this, err);
+      });
+    });
     this.ws.on("error", this.error.bind(this));
     this.ws.on("message", this.message.bind(this));
     this.ws.on("close", this.close.bind(this));
@@ -777,10 +785,19 @@ class Node {
     // failed or no destination was available, players can still be attached
     // to this node. Without this cleanup, destroyNode() after disconnect()
     // would leave orphaned players in riffy.players with no node.
+    // Use skipRest=true when already disconnected — the WebSocket is closed,
+    // so a REST DELETE would produce an unhandled rejection.
+    const wasConnected = this.connected;
     this.riffy.players.forEach((player) => {
       if (player.node !== this) return;
 
-      this.riffy.destroyPlayer(player.guildId);
+      if (wasConnected) {
+        this.riffy.destroyPlayer(player.guildId);
+      } else {
+        // Already disconnected — skip the REST DELETE (Lavalink is unreachable)
+        player.destroy(true);
+        this.riffy.emit("playerDestroy", player);
+      }
     });
 
     this.ws?.close(1000, "destroy");
