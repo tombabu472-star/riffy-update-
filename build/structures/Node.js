@@ -624,15 +624,6 @@ class Node {
       throw new Error(`Node (${this.name} - URL: ${this.restUrl}) Failed to fetch info on WS-OPEN`);
     }
 
-    if (this.autoResume) {
-      for (const player of this.riffy.players.values()) {
-        if (player.node === this) {
-          player.restart().catch((err) => {
-            this.riffy.emit("debug", `[Node: ${this.name}] autoResume restart failed for ${player.guildId}: ${err.message}`);
-          });
-        }
-      }
-    }
   }
 
   error(event) {
@@ -680,6 +671,20 @@ class Node {
         if (this.resumeKey) {
           this.rest.makeRequest(`PATCH`, `/${this.rest.version}/sessions/${this.sessionId}`, { resumingKey: this.resumeKey, timeout: this.resumeTimeout });
           this.riffy.emit("debug", `[Node: ${this.name}] Resuming configured (v3).`);
+        }
+      }
+
+      // Auto-resume AFTER the ready packet updates sessionId — not in open().
+      // Previously, open() called restart() before the ready packet arrived,
+      // so REST calls used a stale/null session ID and PATCHed the wrong
+      // Lavalink endpoint. Now restart() runs after sessionId is set.
+      if (this.autoResume) {
+        for (const player of this.riffy.players.values()) {
+          if (player.node === this) {
+            player.restart().catch((err) => {
+              this.riffy.emit("debug", `[Node: ${this.name}] autoResume restart failed for ${player.guildId}: ${err.message}`);
+            });
+          }
         }
       }
     }
@@ -749,10 +754,14 @@ class Node {
       // Even on terminal/clean destroy, clean up associated players —
       // close()/disconnect() may have failed to migrate them, leaving
       // orphaned players in riffy.players pointing at this node.
+      // Use skipRest=true because this branch is reached after reconnect
+      // attempts are exhausted — Lavalink is likely unreachable, so a
+      // REST DELETE would produce an unhandled rejection.
       this.riffy.players.forEach((player) => {
         if (player.node !== this) return;
 
-        this.riffy.destroyPlayer(player.guildId);
+        player.destroy(true); // skipRest=true: Lavalink may be unreachable
+        this.riffy.emit("playerDestroy", player);
       });
       if (this.ws) this.ws?.close(1000, "Clean Destroy");
       this.ws?.removeAllListeners();
