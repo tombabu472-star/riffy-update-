@@ -857,12 +857,31 @@ class Player extends EventEmitter {
             // despite the user having deliberately stopped playback.
             this.riffy.emit("debug", `[Player ${this.guildId}] restart(): no current track, starting next from queue.`);
             try {
+                // After a Lavalink WS reconnect, the new session has no
+                // voice binding. Connection.resolve() may return immediately
+                // from cached creds. Force-send voice credentials to the new
+                // session BEFORE play() — otherwise Lavalink accepts the
+                // track but produces no audio.
+                const conn = this.connection;
+                if (conn && conn.voice && conn.voice.sessionId && conn.voice.endpoint && conn.voice.token) {
+                    await this.node.rest.updatePlayer({
+                        guildId: this.guildId,
+                        data: {
+                            voice: {
+                                sessionId: conn.voice.sessionId,
+                                endpoint: conn.voice.endpoint,
+                                token: conn.voice.token,
+                                channelId: this.voiceChannel,
+                            },
+                        },
+                    });
+                }
                 await this.play();
                 if (this.playing) {
                     this.riffy.emit("playerResumed", this);
                 }
             } catch (e) {
-                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): play() failed: ${e.message}`);
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): queue play() failed: ${e.message}`);
             }
         } else {
             this.riffy.emit("debug", `[Player ${this.guildId}] restart(): nothing to resume (stopped or empty).`);
@@ -885,9 +904,9 @@ class Player extends EventEmitter {
 
         this.migrating = true;
 
-        try {
-            const oldNode = this.node;
+        const oldNode = this.node;
 
+        try {
             const { player, ...filterData } = this.filters;
 
             const state = {
@@ -907,9 +926,12 @@ class Player extends EventEmitter {
                 await oldNode.rest.destroyPlayer(this.guildId);
             }
 
-            this.node = newNode;
-
-            await this.node.rest.updatePlayer({
+            // Create the player on the destination node FIRST. Only assign
+            // this.node = newNode AFTER the destination REST calls succeed.
+            // If they reject, we catch and roll back to the old node so
+            // the player isn't orphaned pointing at a node that has no
+            // Lavalink player for it.
+            await newNode.rest.updatePlayer({
                 guildId: this.guildId,
                 data: {
                     voice: state.voice
@@ -917,7 +939,7 @@ class Player extends EventEmitter {
             });
 
             if (state.track) {
-                await this.node.rest.updatePlayer({
+                await newNode.rest.updatePlayer({
                     guildId: this.guildId,
                     data: {
                         track: {
@@ -930,6 +952,31 @@ class Player extends EventEmitter {
                     }
                 });
             }
+
+            // All destination REST calls succeeded — now safe to switch.
+            this.node = newNode;
+        } catch (err) {
+            // Migration failed — roll back. Don't leave this.node pointing
+            // at the destination if the player wasn't created there.
+            // If the old node was already destroyed, the player will be
+            // cleaned up by the next destroy()/disconnect() cycle.
+            if (oldNode.connected) {
+                // Old node still alive — re-create the player there.
+                this.node = oldNode;
+                try {
+                    await oldNode.rest.updatePlayer({
+                        guildId: this.guildId,
+                        data: {
+                            track: { encoded: this.current?.track },
+                            position: this.position,
+                            volume: this.volume,
+                            paused: this.paused,
+                            voice: state.voice,
+                        }
+                    });
+                } catch (_) { /* best-effort rollback */ }
+            }
+            throw err; // Re-throw so caller (disconnect) can handle/log it.
         } finally {
             this.migrating = false;
         }
