@@ -697,7 +697,13 @@ class Node {
       // Previously, open() called restart() before the ready packet arrived,
       // so REST calls used a stale/null session ID and PATCHed the wrong
       // Lavalink endpoint. Now restart() runs after sessionId is set.
-      if (this.autoResume) {
+      //
+      // IMPORTANT: only restart when the session was NOT resumed. When
+      // payload.resumed is true, Lavalink has already restored the player
+      // state (track, position, paused, volume). Calling restart() would
+      // re-send the cached track/position, potentially rewinding playback
+      // to a stale position and reapplying stale paused/volume state.
+      if (this.autoResume && !payload.resumed) {
         for (const player of this.riffy.players.values()) {
           if (player.node === this) {
             player.restart().catch((err) => {

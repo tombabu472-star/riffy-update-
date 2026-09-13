@@ -922,9 +922,12 @@ class Player extends EventEmitter {
                 }
             };
 
-            if (oldNode.connected) {
-                await oldNode.rest.destroyPlayer(this.guildId);
-            }
+            // Always attempt old player deletion — even when oldNode.connected
+            // is false (close()/disconnect() sets it before migrate runs).
+            // The old Lavalink REST endpoint may still be reachable even if
+            // the WebSocket is closed. Use .catch() to avoid unhandled
+            // rejections if the node is truly unreachable.
+            await oldNode.rest.destroyPlayer(this.guildId).catch(() => {});
 
             // Create the player on the destination node FIRST. Only assign
             // this.node = newNode AFTER the destination REST calls succeed.
@@ -956,12 +959,15 @@ class Player extends EventEmitter {
             // All destination REST calls succeeded — now safe to switch.
             this.node = newNode;
         } catch (err) {
-            // Migration failed — roll back. Don't leave this.node pointing
-            // at the destination if the player wasn't created there.
-            // If the old node was already destroyed, the player will be
-            // cleaned up by the next destroy()/disconnect() cycle.
+            // Migration failed — clean up the partially-created destination
+            // player (if the voice PATCH succeeded but the track PATCH failed,
+            // the destination has an orphaned player with no track).
+            try {
+                await newNode.rest.destroyPlayer(this.guildId);
+            } catch (_) { /* best-effort cleanup */ }
+
+            // Roll back — don't leave this.node pointing at the destination.
             if (oldNode.connected) {
-                // Old node still alive — re-create the player there.
                 this.node = oldNode;
                 try {
                     await oldNode.rest.updatePlayer({
