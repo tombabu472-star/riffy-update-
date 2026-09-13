@@ -816,14 +816,31 @@ class Player extends EventEmitter {
             }
 
             const encoded = this.current.track || this.current.encoded;
+            // After a Lavalink WS reconnect, the new server connection has no
+            // player voice state — Connection.resolve() may return immediately
+            // from cached credentials, and checkAndSend() may skip the update
+            // because the cached creds match the last sent values. So we MUST
+            // include the current voice credentials in the restart updatePlayer
+            // to force the new Lavalink server to bind the voice session.
+            const restartData = {
+                track: { encoded },
+                position: this.position || 0,
+                volume: this.volume,
+                paused: this.paused,
+            };
+            // Include voice credentials so Lavalink re-binds the voice session.
+            const conn = this.connection;
+            if (conn && conn.voice && conn.voice.sessionId && conn.voice.endpoint && conn.voice.token) {
+                restartData.voice = {
+                    sessionId: conn.voice.sessionId,
+                    endpoint: conn.voice.endpoint,
+                    token: conn.voice.token,
+                    channelId: this.voiceChannel,
+                };
+            }
             await this.node.rest.updatePlayer({
                 guildId: this.guildId,
-                data: {
-                    track: { encoded },
-                    position: this.position || 0,
-                    volume: this.volume,
-                    paused: this.paused,
-                },
+                data: restartData,
             });
 
             this.riffy.emit("debug", `[Player ${this.guildId}] restart(): resumed "${this.current.info?.title || "Unknown"}" at ${this.position || 0}ms (paused=${this.paused}).`);

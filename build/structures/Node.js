@@ -755,19 +755,16 @@ class Node {
       return;
     }
 
-    // If already disconnected (e.g. after disconnect()), we still need to
-    // perform cleanup: close ws, clear reconnect timers, emit nodeDestroy,
-    // and delete from nodeMap. Without this, destroyNode() after disconnect()
-    // silently leaves the node registered.
-    // Player cleanup is only done if we were connected (disconnect() already
-    // migrated or destroyed players).
-    if (this.connected) {
-      this.riffy.players.forEach((player) => {
-        if (player.node !== this) return;
+    // Always clean up associated players — even when already disconnected.
+    // If disconnect() ran, it tried to migrate players; but if migration
+    // failed or no destination was available, players can still be attached
+    // to this node. Without this cleanup, destroyNode() after disconnect()
+    // would leave orphaned players in riffy.players with no node.
+    this.riffy.players.forEach((player) => {
+      if (player.node !== this) return;
 
-        this.riffy.destroyPlayer(player.guildId);
-      });
-    }
+      this.riffy.destroyPlayer(player.guildId);
+    });
 
     this.ws?.close(1000, "destroy");
     this.ws?.removeAllListeners();
