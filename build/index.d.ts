@@ -476,6 +476,7 @@ export declare const enum RiffyEventType {
     PlayerUpdate = "playerUpdate",
     PlayerMigrationFailed = "playerMigrationFailed",
     PlayerMigrated = "playerMigrated",
+    PlayerResumed = "playerResumed",
     QueueEnd = "queueEnd",
 
     // Misc Events
@@ -643,6 +644,13 @@ export type RiffyEvents = {
      * @returns 
      */
     "playerMigrated": (player: Player, oldNode: Node, newNode: Node) => void;
+
+    /**
+     * Emitted when a player has been resumed via Player.restart() (e.g. after
+     * a Lavalink WebSocket reconnect with autoResume enabled).
+     * @param player The player that was resumed.
+     */
+    "playerResumed": (player: Player) => void;
 
     /**
      * Emitted when a player's queue ends

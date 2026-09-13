@@ -172,7 +172,17 @@ class Player extends EventEmitter {
 
             if (!this.current) {
                 this.riffy.emit("debug", `[Player ${this.guildId}] Track "${unresolvedTrack.info?.title || "Unknown"}" could not be resolved, skipping.`);
-                this.riffy.emit("trackError", this, unresolvedTrack, { message: "Track could not be resolved (no search results found)" });
+                this.riffy.emit("trackError", this, unresolvedTrack, {
+                    op: "event",
+                    type: "TrackExceptionEvent",
+                    guildId: this.guildId,
+                    track: unresolvedTrack.track || unresolvedTrack.encoded,
+                    exception: {
+                        message: "Track could not be resolved (no search results found)",
+                        severity: "common",
+                        cause: "No search results found during track resolution",
+                    },
+                });
                 if (this.queue.length > 0) {
                     return this.play();
                 }
@@ -818,7 +828,12 @@ class Player extends EventEmitter {
             this.riffy.emit("debug", `[Player ${this.guildId}] restart(): no current track, starting next from queue.`);
             try {
                 await this.play();
-                this.riffy.emit("playerResumed", this);
+                // Only emit playerResumed if playback actually started — if all
+                // tracks failed resolution, play() returns with playing=false
+                // and emitting playerResumed would be a false success.
+                if (this.playing) {
+                    this.riffy.emit("playerResumed", this);
+                }
             } catch (e) {
                 this.riffy.emit("debug", `[Player ${this.guildId}] restart(): play() failed: ${e.message}`);
             }

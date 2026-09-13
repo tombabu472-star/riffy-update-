@@ -779,10 +779,17 @@ class Node {
 
   disconnect() {
     if (!this.connected) return;
+    // Mark as disconnected FIRST so bestNode won't select this node as a
+    // migration target (bestNode filters by node.connected).
+    this.connected = false;
     this.riffy.players.forEach((player) => {
       if (player.node == this) {
-        if (this.riffy.bestNode) {
-          player.moveTo(this.riffy.bestNode).catch((err) => {
+        // Find a destination node that is NOT this one (which is disconnecting).
+        const dest = [...this.riffy.nodeMap.values()]
+          .filter(n => n.connected && n !== this)
+          .sort((a, b) => a.penalties - b.penalties)[0];
+        if (dest) {
+          player.moveTo(dest).catch((err) => {
             this.riffy.emit("debug", `[Node: ${this.name}] disconnect() moveTo failed for ${player.guildId}: ${err.message}`);
           });
         }
