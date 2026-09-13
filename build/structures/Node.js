@@ -599,10 +599,17 @@ class Node {
     // Wrap open() in a catch — it's async and can throw (fetchInfo fails,
     // info missing). WebSocket doesn't await or catch the handler's promise,
     // so an unhandled rejection would crash the process on Node 15+.
+    // On failure, reset connected + schedule reconnect (don't leave the node
+    // in a half-open state).
     this.ws.on("open", () => {
       this.open().catch((err) => {
         this.riffy.emit("debug", `[Node: ${this.name}] open() failed: ${err.message}`);
         this.riffy.emit("nodeError", this, err);
+        // Reset state — don't leave the node marked connected when open() failed
+        this.connected = false;
+        this.ws?.close();
+        this.ws = null;
+        this.reconnect();
       });
     });
     this.ws.on("error", this.error.bind(this));
@@ -672,12 +679,16 @@ class Node {
 
       if (this.restVersion === "v4") {
         if (this.sessionId) {
-          this.rest.makeRequest(`PATCH`, `/${this.rest.version}/sessions/${this.sessionId}`, { resuming: true, timeout: this.resumeTimeout });
+          this.rest.makeRequest(`PATCH`, `/${this.rest.version}/sessions/${this.sessionId}`, { resuming: true, timeout: this.resumeTimeout }).catch((e) => {
+            this.riffy.emit("debug", `[Node: ${this.name}] Session-resume PATCH failed (v4): ${e.message}`);
+          });
           this.riffy.emit("debug", `[Node: ${this.name}] Resuming configured (v4).`);
         }
       } else {
         if (this.resumeKey) {
-          this.rest.makeRequest(`PATCH`, `/${this.rest.version}/sessions/${this.sessionId}`, { resumingKey: this.resumeKey, timeout: this.resumeTimeout });
+          this.rest.makeRequest(`PATCH`, `/${this.rest.version}/sessions/${this.sessionId}`, { resumingKey: this.resumeKey, timeout: this.resumeTimeout }).catch((e) => {
+            this.riffy.emit("debug", `[Node: ${this.name}] Session-resume PATCH failed (v3): ${e.message}`);
+          });
           this.riffy.emit("debug", `[Node: ${this.name}] Resuming configured (v3).`);
         }
       }
@@ -814,34 +825,35 @@ class Node {
     this.connected = false;
   }
 
-  disconnect() {
+  async disconnect() {
     if (!this.connected) return;
     // Find a destination node BEFORE setting connected=false, because
     // Player.moveTo() only calls oldNode.rest.destroyPlayer() when
     // oldNode.connected is true. If we set connected=false first, the
     // old Lavalink player isn't deleted — leaving an orphan on the
     // disconnecting node. We set connected=false AFTER migration.
+    // Await all moves so destroy() can't race with in-flight migrations.
+    const movePromises = [];
     this.riffy.players.forEach((player) => {
       if (player.node == this) {
-        // Find a destination node that is NOT this one.
         const dest = [...this.riffy.nodeMap.values()]
           .filter(n => n.connected && n !== this)
           .sort((a, b) => a.penalties - b.penalties)[0];
         if (dest) {
-          player.moveTo(dest).catch((err) => {
-            this.riffy.emit("debug", `[Node: ${this.name}] disconnect() moveTo failed for ${player.guildId}: ${err.message}`);
-          });
+          movePromises.push(
+            player.moveTo(dest).catch((err) => {
+              this.riffy.emit("debug", `[Node: ${this.name}] disconnect() moveTo failed for ${player.guildId}: ${err.message}`);
+            })
+          );
         }
       }
     });
-    // Now safe to mark as disconnected — moveTo() has already had a chance
-    // to destroy the old Lavalink player via oldNode.rest.destroyPlayer().
+    // Wait for all migrations to complete before closing the WS.
+    await Promise.allSettled(movePromises);
+    // Now safe to mark as disconnected + close WS — migrations are done.
     this.ws?.close(1000, "destroy");
     this.ws?.removeAllListeners();
     this.ws = null;
-    // Now mark as disconnected — after moveTo() has had a chance to
-    // destroy the old Lavalink player (which requires oldNode.connected
-    // to be true).
     this.connected = false;
     // Allowing to connect back.
     // this.riffy.nodeMap.delete(this.name);

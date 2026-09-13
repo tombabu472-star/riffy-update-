@@ -544,7 +544,11 @@ class Player extends EventEmitter {
     destroy(skipRest = false) {
         this.disconnect();
         if (!skipRest) {
-            this.node.rest.destroyPlayer(this.guildId);
+            // Catch the REST DELETE rejection — destroy() is synchronous and
+            // must not produce an unhandled rejection if Lavalink is
+            // unreachable or returns a non-2xx. Local cleanup proceeds
+            // regardless of the REST result.
+            this.node.rest.destroyPlayer(this.guildId).catch(() => {});
         }
         this.removeAllListeners();
         this.connection = null;
