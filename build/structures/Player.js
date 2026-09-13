@@ -167,7 +167,19 @@ class Player extends EventEmitter {
                 throw new Error(`Unable to play for Player with Guild Id ${this.guildId}, Track is not encoded and cannot be resolved.`);
             }
 
+            const unresolvedTrack = this.current;
             this.current = await this.current.resolve(this.riffy);
+
+            if (!this.current) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] Track "${unresolvedTrack.info?.title || "Unknown"}" could not be resolved, skipping.`);
+                this.riffy.emit("trackError", this, unresolvedTrack, { message: "Track could not be resolved (no search results found)" });
+                if (this.queue.length > 0) {
+                    return this.play();
+                }
+                this.playing = false;
+                this.riffy.emit("queueEnd", this);
+                return this;
+            }
         }
 
         if (!this.current?.track) {
@@ -516,16 +528,18 @@ class Player extends EventEmitter {
 
     /**
      * Destroys the player.
+     * @param {boolean} [skipRest=false] If true, skip the REST DELETE call
+     *   to Lavalink (use when the caller has already sent a DELETE).
      */
-    destroy() {
+    destroy(skipRest = false) {
         this.disconnect();
-        this.node.rest.destroyPlayer(this.guildId);
+        if (!skipRest) {
+            this.node.rest.destroyPlayer(this.guildId);
+        }
         this.removeAllListeners();
         this.connection = null;
         this.riffy.emit("playerDisconnect", this);
         this.queue.clear();
-        // let the rest properties such as previous track, current
-        // get cleared with GC. As the user can use this values from event (playerDisconnect, playerDestroy)
         this.riffy.emit("debug", `[Player ${this.guildId}] Destroyed!`);
         this.riffy.players.delete(this.guildId);
     }
@@ -752,6 +766,66 @@ class Player extends EventEmitter {
                 delete this.data[key];
             }
         }
+        return this;
+    }
+
+    /**
+     * Restarts the player — rejoins the configured voice channel and resumes
+     * playback of the current track at the last known position.
+     *
+     * Used by Node-level `autoResume` (when the Lavalink WebSocket
+     * reconnects). Previously, `Node.open()` called `player.restart()` but
+     * the method did not exist — causing a TypeError on every reconnect.
+     *
+     * @returns {Promise<this>}
+     * @emits playerResumed
+     */
+    async restart() {
+        if (!this.voiceChannel) {
+            this.riffy.emit("debug", `[Player ${this.guildId}] restart() called but no voiceChannel is set, aborting.`);
+            return this;
+        }
+
+        this.connect({
+            guildId: this.guildId,
+            voiceChannel: this.voiceChannel,
+            deaf: this.deaf,
+            mute: this.mute,
+        });
+
+        if (this.current && (this.current.track || this.current.encoded)) {
+            try {
+                await this.connection.resolve();
+            } catch (e) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): voice credentials not ready, aborting: ${e.message}`);
+                return this;
+            }
+
+            const encoded = this.current.track || this.current.encoded;
+            await this.node.rest.updatePlayer({
+                guildId: this.guildId,
+                data: {
+                    track: { encoded },
+                    position: this.position || 0,
+                    volume: this.volume,
+                    paused: this.paused,
+                },
+            });
+
+            this.riffy.emit("debug", `[Player ${this.guildId}] restart(): resumed "${this.current.info?.title || "Unknown"}" at ${this.position || 0}ms (paused=${this.paused}).`);
+            this.riffy.emit("playerResumed", this);
+        } else if (this.queue.length > 0) {
+            this.riffy.emit("debug", `[Player ${this.guildId}] restart(): no current track, starting next from queue.`);
+            try {
+                await this.play();
+                this.riffy.emit("playerResumed", this);
+            } catch (e) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): play() failed: ${e.message}`);
+            }
+        } else {
+            this.riffy.emit("debug", `[Player ${this.guildId}] restart(): no current track and empty queue, nothing to resume.`);
+        }
+
         return this;
     }
 

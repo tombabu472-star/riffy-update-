@@ -113,9 +113,9 @@ class Riffy extends EventEmitter {
   destroyNode(identifier) {
     const node = this.nodeMap.get(identifier);
     if (!node) return;
+    // node.destroy() already emits "nodeDestroy" and deletes from nodeMap,
+    // so we don't duplicate them here (was double-emitting nodeDestroy).
     node.destroy();
-    this.nodeMap.delete(identifier);
-    this.emit("nodeDestroy", node);
   }
 
   /**
@@ -300,8 +300,9 @@ class Riffy extends EventEmitter {
   }
 
   removeConnection(guildId) {
-    this.players.get(guildId)?.destroy();
-    this.players.delete(guildId);
+    // Delegate through destroyPlayer() so both playerDisconnect AND
+    // playerDestroy events fire (player.destroy() only emits playerDisconnect).
+    this.destroyPlayer(guildId);
   }
 
   /**

@@ -314,7 +314,18 @@ export declare class Player extends EventEmitter {
     }): Player;
 
     public disconnect(): Player | void;
-    public destroy(): void;
+    /**
+     * Destroys the player.
+     * @param skipRest If true, skip the REST DELETE to Lavalink (use when
+     *   the caller has already sent a DELETE).
+     */
+    public destroy(skipRest?: boolean): void;
+    /**
+     * Restarts the player — rejoins the configured voice channel and resumes
+     * the current track at the last known position. Powers Node.autoResume.
+     * @emits playerResumed
+     */
+    public restart(): Promise<Player>;
     private handleEvent(payload: NodePlayerEvent): void;
     private trackStart(player: Player, track: Track, payload: PlayerTrackStartEventPayload): void;
     private trackEnd(player: Player, track: Track, payload: PlayerTrackEndEventPayload<this["node"]["restVersion"]>): void;
