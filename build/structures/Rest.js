@@ -40,9 +40,11 @@ class Rest {
       return this.makeRequest(method, endpoint, body, includeHeaders, retryCount + 1);
     }
 
-    // Reject on non-2xx responses (4xx) — previously, a 400/404 would resolve
-    // normally and callers would treat the update as successful. This caused
-    // playerResumed to fire even though Lavalink rejected the update.
+    // Reject on non-2xx responses (4xx, 5xx after retries exhausted).
+    // Lavalink returns 204 for successful PATCH/DELETE with no body —
+    // response.ok is true for 204, so that's not affected.
+    // Previously, a 400/404 would resolve normally and callers would
+    // treat the update as successful (e.g. playerResumed fired).
     if (!response.ok) {
       throw new Error(`REST ${method} ${endpoint} failed with status ${response.status} (${response.statusText})`);
     }
