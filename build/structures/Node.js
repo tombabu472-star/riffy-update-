@@ -633,7 +633,12 @@ class Node {
       });
     });
     this.ws.on("error", this.error.bind(this));
-    this.ws.on("message", this.message.bind(this));
+    // Capture socket for message handler — a late message from socket A
+    // (e.g. a ready packet) must NOT overwrite sessionId/_ready or trigger
+    // auto-resume when socket B has already replaced it.
+    this.ws.on("message", (msg) => {
+      this.message(msg, socket);
+    });
     // Track the close() promise so destroy() can await it before removing players.
     // Capture the socket so close() can verify it hasn't been replaced by
     // a newer reconnect before mutating lifecycle state.
@@ -704,7 +709,12 @@ class Node {
     }
   }
 
-  message(msg) {
+  message(msg, socket) {
+    // If the socket that emitted this message has been replaced by a newer
+    // reconnect, ignore it — don't overwrite sessionId/_ready or trigger
+    // auto-resume for a stale session.
+    if (socket && this.ws !== socket) return;
+
     if (Array.isArray(msg)) msg = Buffer.concat(msg);
     else if (msg instanceof ArrayBuffer) msg = Buffer.from(msg);
 
