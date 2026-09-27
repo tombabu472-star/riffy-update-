@@ -57,7 +57,7 @@ class Riffy extends EventEmitter {
 
   _defaultMigrationStrategy(player, availableNodes) {
     return availableNodes
-      .filter(n => n.connected && n !== player.node)
+      .filter(n => n.connected && !n._migrating && n !== player.node)
       .sort((a, b) => a.penalties - b.penalties)[0];
   }
 
@@ -110,12 +110,12 @@ class Riffy extends EventEmitter {
    * Destroy a Node
    * @param {string} identifier Node name or host
    */
-  destroyNode(identifier) {
+  async destroyNode(identifier) {
     const node = this.nodeMap.get(identifier);
     if (!node) return;
-    // node.destroy() already emits "nodeDestroy" and deletes from nodeMap,
-    // so we don't duplicate them here (was double-emitting nodeDestroy).
-    node.destroy();
+    // node.destroy() is async — awaits in-flight migration before cleanup.
+    // Return the promise so callers can await cleanup completion.
+    await node.destroy();
   }
 
   /**
@@ -225,7 +225,7 @@ class Riffy extends EventEmitter {
       if (destinationNode) {
         node = destinationNode;
       } else {
-        const availableNodes = [...this.nodeMap.values()].filter(n => n.connected && n !== player.node);
+        const availableNodes = [...this.nodeMap.values()].filter(n => n.connected && !n._migrating && n !== player.node);
         node = this.migrationStrategyFn(player, availableNodes);
       }
 
@@ -259,7 +259,7 @@ class Riffy extends EventEmitter {
       }
 
       const availableNodes = [...this.nodeMap.values()]
-        .filter(n => n.connected && n !== nodeToMigrate)
+        .filter(n => n.connected && !n._migrating && n !== nodeToMigrate)
         .sort((a, b) => a.penalties - b.penalties);
 
       if (!availableNodes.length) {

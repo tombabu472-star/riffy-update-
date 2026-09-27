@@ -605,7 +605,7 @@ class Node {
     // close B — only close/replace if this.ws === socketA.
     const socket = this.ws;
     this.ws.on("open", () => {
-      this.open().catch((err) => {
+      this.open(socket).catch((err) => {
         this.riffy.emit("debug", `[Node: ${this.name}] open() failed: ${err.message}`);
         this.riffy.emit("nodeError", this, err);
         // Only tear down if this is still the current socket — a newer
@@ -632,7 +632,11 @@ class Node {
     });
   }
 
-  async open() {
+  async open(socket) {
+    // If the socket has been replaced by a newer reconnect, abort —
+    // don't mark the node as connected or set info from a stale connection.
+    if (this.ws !== socket) return;
+
     if (this.reconnectAttempt) {
       clearTimeout(this.reconnectAttempt);
       this.reconnectAttempted = 1;
@@ -644,7 +648,13 @@ class Node {
 
     this.info =
           await this.fetchInfo()
-            .then((info) => this.info = info)
+            .then((info) => {
+              // Check again — a reconnect may have replaced the socket
+              // while fetchInfo() was awaiting.
+              if (this.ws !== socket) return null;
+              this.info = info;
+              return info;
+            })
             .catch((e) => (this.riffy.emit('debug', `[Node: ${this.name}] Failed to fetch info on open: ${e.message}`)));
 
     // @ts-ignore this.options exists on the constructor
@@ -858,17 +868,14 @@ class Node {
 
   async disconnect() {
     if (!this.connected) return;
-    // Find a destination node BEFORE setting connected=false, because
-    // Player.moveTo() only calls oldNode.rest.destroyPlayer() when
-    // oldNode.connected is true. If we set connected=false first, the
-    // old Lavalink player isn't deleted — leaving an orphan on the
-    // disconnecting node. We set connected=false AFTER migration.
-    // Await all moves so destroy() can't race with in-flight migrations.
+    // Set _migrating so leastUsedNodes/bestNode exclude this node during
+    // migration. Store _closePromise so destroy() can await it.
+    this._migrating = true;
     const movePromises = [];
     this.riffy.players.forEach((player) => {
       if (player.node == this) {
         const dest = [...this.riffy.nodeMap.values()]
-          .filter(n => n.connected && n !== this)
+          .filter(n => n.connected && !n._migrating && n !== this)
           .sort((a, b) => a.penalties - b.penalties)[0];
         if (dest) {
           movePromises.push(
@@ -879,15 +886,13 @@ class Node {
         }
       }
     });
-    // Wait for all migrations to complete before closing the WS.
     await Promise.allSettled(movePromises);
-    // Now safe to mark as disconnected + close WS — migrations are done.
+    this._migrating = false;
+    this._closePromise = null;
     this.ws?.close(1000, "destroy");
     this.ws?.removeAllListeners();
     this.ws = null;
     this.connected = false;
-    // Allowing to connect back.
-    // this.riffy.nodeMap.delete(this.name);
     this.riffy.emit("nodeDisconnect", this);
   }
 

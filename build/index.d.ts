@@ -806,7 +806,7 @@ export declare class Riffy extends EventEmitter {
 
     public createNode(options: LavalinkNode): Node;
 
-    public destroyNode(identifier: string): void;
+    public destroyNode(identifier: string): Promise<void>;
 
     public updateVoiceState(packet: any): Promise<void>;
 
@@ -1463,7 +1463,7 @@ export declare class Node {
     public close(event: any, reason: string): Promise<void>;
     public reconnect(): void;
   public disconnect(): Promise<void>;
-    public destroy(clean?: boolean): void;
+    public destroy(clean?: boolean): Promise<void>;
     readonly penalties: number;
 }
 
