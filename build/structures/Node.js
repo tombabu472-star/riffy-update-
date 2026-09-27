@@ -80,6 +80,7 @@ class Node {
     this.connected = false;
     this._destroyed = false;
     this._migrating = false;
+    this._closePromise = null;
 
     this.resumeKey = options.resumeKey || null;
     this.resumeTimeout = options.resumeTimeout || 60;
@@ -598,29 +599,37 @@ class Node {
     }
 
     this.ws = new Websocket(this.wsUrl, { headers });
-    // Wrap open() in a catch — it's async and can throw (fetchInfo fails,
-    // info missing). WebSocket doesn't await or catch the handler's promise,
-    // so an unhandled rejection would crash the process on Node 15+.
-    // On failure, reset connected + schedule reconnect (don't leave the node
-    // in a half-open state).
+    // Capture the socket so the open() catch handler can verify it hasn't
+    // been replaced by a newer reconnect. If WebSocket A is awaiting
+    // fetchInfo() while reconnect creates WebSocket B, A's catch must NOT
+    // close B — only close/replace if this.ws === socketA.
+    const socket = this.ws;
     this.ws.on("open", () => {
       this.open().catch((err) => {
         this.riffy.emit("debug", `[Node: ${this.name}] open() failed: ${err.message}`);
         this.riffy.emit("nodeError", this, err);
-        // Reset state — don't leave the node marked connected when open() failed.
-        // Check _destroyed first — if the node was destroyed while open() was
-        // awaiting fetchInfo(), don't reconnect a dead node.
-        this.connected = false;
-        this.ws?.close();
-        this.ws = null;
-        if (!this._destroyed) {
+        // Only tear down if this is still the current socket — a newer
+        // reconnect may have already replaced it.
+        if (this.ws === socket) {
+          this.connected = false;
+          this.ws?.close();
+          this.ws = null;
+        }
+        if (!this._destroyed && this.ws !== socket) {
+          // Socket was already replaced or cleaned up — don't reconnect
+          // if a newer connection exists.
+          if (!this.ws) this.reconnect();
+        } else if (!this._destroyed) {
           this.reconnect();
         }
       });
     });
     this.ws.on("error", this.error.bind(this));
     this.ws.on("message", this.message.bind(this));
-    this.ws.on("close", this.close.bind(this));
+    // Track the close() promise so destroy() can await it before removing players.
+    this.ws.on("close", (event, reason) => {
+      this._closePromise = this.close(event, reason);
+    });
   }
 
   async open() {
@@ -732,10 +741,9 @@ class Node {
     if (this._destroyed) return;
 
     // Mark the node as unavailable for NEW connections immediately (so
-    // leastUsedNodes/bestNode don't select it), but keep connected=true
-    // so Player.moveTo() can still use oldNode.rest to delete old players.
-    // The _migrating flag prevents destroy() from removing players while
-    // migration is in-flight.
+    // leastUsedNodes/bestNode don't select it via _migrating filter), but
+    // keep connected=true so Player.moveTo() can still use oldNode.rest
+    // to delete old players.
     this._migrating = true;
     if (this.riffy.migrateOnDisconnect) {
       try {
@@ -745,6 +753,7 @@ class Node {
       }
     }
     this._migrating = false;
+    this._closePromise = null;
     // NOW safe to mark as disconnected — migration is complete.
     this.connected = false;
     if (!this._destroyed) {
@@ -792,9 +801,16 @@ class Node {
    *                                  - Deleting the node from the node map.
    *                                  - Setting the connected state to false.
    */
-  destroy(clean = false) {
+  async destroy(clean = false) {
     this._destroyed = true;
 
+    // If close()-triggered migration is in-flight, await it before
+    // destroying players — otherwise the in-flight moveTo() could
+    // PATCH the destination after we've removed the local player,
+    // creating an orphaned Lavalink player with no local owner.
+    if (this._closePromise) {
+      try { await this._closePromise; } catch (_) { /* migration already failed */ }
+    }
     if (clean) {
       // Terminal destroy after reconnect exhaustion. Player.destroy() now
       // catches REST DELETE failures, so we always attempt the DELETE
