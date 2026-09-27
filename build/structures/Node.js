@@ -635,8 +635,10 @@ class Node {
     this.ws.on("error", this.error.bind(this));
     this.ws.on("message", this.message.bind(this));
     // Track the close() promise so destroy() can await it before removing players.
+    // Capture the socket so close() can verify it hasn't been replaced by
+    // a newer reconnect before mutating lifecycle state.
     this.ws.on("close", (event, reason) => {
-      this._closePromise = this.close(event, reason);
+      this._closePromise = this.close(event, reason, socket);
     });
   }
 
@@ -771,12 +773,17 @@ class Node {
     if (payload.guildId && player) player.emit(payload.op, payload);
   }
 
-  async close(event, reason, ...args) {
+  async close(event, reason, socket, ...args) {
         reason = reason.toString();
     this.riffy.emit("nodeDisconnect", this, { code: event, reason: reason });
     this.riffy.emit("debug", `Connection with Lavalink closed with Error code : ${event || "Unknown code"}, reason: ${reason || "Unknown reason"}`);
 
     if (this._destroyed) return;
+
+    // If the socket that emitted this close has been replaced by a newer
+    // reconnect, abort — don't tear down the newer connection's state,
+    // start migration, or call reconnect() against the replacement.
+    if (socket && this.ws !== socket) return;
 
     // Mark the node as unavailable for NEW connections immediately (so
     // leastUsedNodes/bestNode don't select it via _migrating filter), but
