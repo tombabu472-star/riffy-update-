@@ -633,8 +633,7 @@ class Node {
   }
 
   async open(socket) {
-    // If the socket has been replaced by a newer reconnect, abort —
-    // don't mark the node as connected or set info from a stale connection.
+    // If the socket has been replaced by a newer reconnect, abort.
     if (this.ws !== socket) return;
 
     if (this.reconnectAttempt) {
@@ -643,27 +642,35 @@ class Node {
       this.reconnectAttempt = null;
     }
 
-    this.connected = true;
+    // DON'T set connected=true yet — wait until fetchInfo() succeeds and
+    // the socket is still current. If we set it here and fetchInfo() fails
+    // or the socket is replaced, connected stays true on a dead node.
     this.riffy.emit('debug', `[Node: ${this.name}] Websocket connection established on ${this.wsUrl}`);
 
-    this.info =
+    const fetchedInfo =
           await this.fetchInfo()
             .then((info) => {
               // Check again — a reconnect may have replaced the socket
               // while fetchInfo() was awaiting.
               if (this.ws !== socket) return null;
-              this.info = info;
               return info;
             })
             .catch((e) => (this.riffy.emit('debug', `[Node: ${this.name}] Failed to fetch info on open: ${e.message}`)));
 
+    // If the socket was replaced during fetchInfo(), abort — don't set
+    // connected or info from a stale connection. The newer socket's open()
+    // will handle the real setup.
+    if (this.ws !== socket) return;
+
+    this.info = fetchedInfo;
+
     // @ts-ignore this.options exists on the constructor
     if (!this.info && !this.options?.bypassChecks?.nodeFetchInfo) {
-      // Throws the Error because it's a critical failure, Node should have info
-      // about the server configuration (i.e sources, version, plugins, etc).
       throw new Error(`Node (${this.name} - URL: ${this.restUrl}) Failed to fetch info on WS-OPEN`);
     }
 
+    // Only mark connected AFTER all checks pass and socket is still current.
+    this.connected = true;
   }
 
   error(event) {
@@ -866,10 +873,15 @@ class Node {
     this.connected = false;
   }
 
-  async disconnect() {
+  disconnect() {
+    // Store the promise so destroy() can await it — without this, calling
+    // disconnect() then destroyNode() would not serialize.
+    this._closePromise = this._doDisconnect();
+    return this._closePromise;
+  }
+
+  async _doDisconnect() {
     if (!this.connected) return;
-    // Set _migrating so leastUsedNodes/bestNode exclude this node during
-    // migration. Store _closePromise so destroy() can await it.
     this._migrating = true;
     const movePromises = [];
     this.riffy.players.forEach((player) => {
