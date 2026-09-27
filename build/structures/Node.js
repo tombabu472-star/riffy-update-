@@ -78,6 +78,7 @@ class Node {
     };
 
     this.connected = false;
+    this._ready = false;
     this._destroyed = false;
     this._migrating = false;
     this._closePromise = null;
@@ -598,8 +599,11 @@ class Node {
       if (this.resumeKey) headers["Resume-Key"] = this.resumeKey;
     }
 
+    if (this.ws) {
+      // Replacing an existing socket — invalidate the old connection's state.
+      this._ready = false;
+    }
     this.ws = new Websocket(this.wsUrl, { headers });
-    // Capture the socket so the open() catch handler can verify it hasn't
     // been replaced by a newer reconnect. If WebSocket A is awaiting
     // fetchInfo() while reconnect creates WebSocket B, A's catch must NOT
     // close B — only close/replace if this.ws === socketA.
@@ -612,6 +616,7 @@ class Node {
         // reconnect may have already replaced it.
         if (this.ws === socket) {
           this.connected = false;
+    this._ready = false;
           this.ws?.close();
           this.ws = null;
         }
@@ -634,7 +639,13 @@ class Node {
 
   async open(socket) {
     // If the socket has been replaced by a newer reconnect, abort.
-    if (this.ws !== socket) return;
+    // Also invalidate connected — the stale socket's completion should
+    // not leave the node marked connected while no valid connection exists.
+    if (this.ws !== socket) {
+      if (this.ws === null) this.connected = false;
+    this._ready = false;
+      return;
+    }
 
     if (this.reconnectAttempt) {
       clearTimeout(this.reconnectAttempt);
@@ -642,25 +653,27 @@ class Node {
       this.reconnectAttempt = null;
     }
 
-    // DON'T set connected=true yet — wait until fetchInfo() succeeds and
-    // the socket is still current. If we set it here and fetchInfo() fails
-    // or the socket is replaced, connected stays true on a dead node.
+    // Set connected=true (WebSocket is open) but _ready=false — the node
+    // is NOT selectable until the ready packet sets sessionId + _ready.
+    this.connected = true;
+    this._ready = false;
     this.riffy.emit('debug', `[Node: ${this.name}] Websocket connection established on ${this.wsUrl}`);
 
     const fetchedInfo =
           await this.fetchInfo()
             .then((info) => {
-              // Check again — a reconnect may have replaced the socket
-              // while fetchInfo() was awaiting.
               if (this.ws !== socket) return null;
               return info;
             })
             .catch((e) => (this.riffy.emit('debug', `[Node: ${this.name}] Failed to fetch info on open: ${e.message}`)));
 
-    // If the socket was replaced during fetchInfo(), abort — don't set
-    // connected or info from a stale connection. The newer socket's open()
-    // will handle the real setup.
-    if (this.ws !== socket) return;
+    // If the socket was replaced during fetchInfo(), invalidate connected
+    // and abort. The newer socket's open() will handle the real setup.
+    if (this.ws !== socket) {
+      this.connected = false;
+    this._ready = false;
+      return;
+    }
 
     this.info = fetchedInfo;
 
@@ -669,8 +682,9 @@ class Node {
       throw new Error(`Node (${this.name} - URL: ${this.restUrl}) Failed to fetch info on WS-OPEN`);
     }
 
-    // Only mark connected AFTER all checks pass and socket is still current.
-    this.connected = true;
+    // connected stays true (WebSocket is open), but _ready is still false.
+    // The node becomes selectable (_ready=true) only when the ready packet
+    // arrives and sets sessionId.
   }
 
   error(event) {
@@ -704,6 +718,9 @@ class Node {
         this.rest.setSessionId(payload.sessionId);
         this.sessionId = payload.sessionId;
       }
+      // Mark the node as ready — it now has a valid session ID and is
+      // selectable by leastUsedNodes/bestNode for player creation.
+      this._ready = true;
 
       this.riffy.emit("nodeConnect", this);
 
@@ -773,6 +790,7 @@ class Node {
     this._closePromise = null;
     // NOW safe to mark as disconnected — migration is complete.
     this.connected = false;
+    this._ready = false;
     if (!this._destroyed) {
       this.reconnect();
     }
@@ -847,6 +865,7 @@ class Node {
       this.riffy.emit("nodeDestroy", this);
       this.riffy.nodeMap.delete(this.name);
       this.connected = false;
+    this._ready = false;
       return;
     }
 
@@ -871,6 +890,7 @@ class Node {
 
     this.riffy.nodeMap.delete(this.name);
     this.connected = false;
+    this._ready = false;
   }
 
   disconnect() {
@@ -905,6 +925,7 @@ class Node {
     this.ws?.removeAllListeners();
     this.ws = null;
     this.connected = false;
+    this._ready = false;
     this.riffy.emit("nodeDisconnect", this);
   }
 

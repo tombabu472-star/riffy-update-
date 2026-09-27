@@ -57,19 +57,19 @@ class Riffy extends EventEmitter {
 
   _defaultMigrationStrategy(player, availableNodes) {
     return availableNodes
-      .filter(n => n.connected && !n._migrating && n !== player.node)
+      .filter(n => n.connected && n._ready && !n._migrating && n !== player.node)
       .sort((a, b) => a.penalties - b.penalties)[0];
   }
 
   get leastUsedNodes() {
     return [...this.nodeMap.values()]
-      .filter((node) => node.connected && !node._migrating)
+      .filter((node) => node.connected && node._ready && !node._migrating)
       .sort((a, b) => a.rest.calls - b.rest.calls);
   }
 
   get bestNode() {
     return [...this.nodeMap.values()]
-      .filter(node => node.connected && !node._migrating)
+      .filter(node => node.connected && node._ready && !node._migrating)
       .sort((a, b) => a.penalties - b.penalties)[0];
   }
 
@@ -225,7 +225,7 @@ class Riffy extends EventEmitter {
       if (destinationNode) {
         node = destinationNode;
       } else {
-        const availableNodes = [...this.nodeMap.values()].filter(n => n.connected && !n._migrating && n !== player.node);
+        const availableNodes = [...this.nodeMap.values()].filter(n => n.connected && n._ready && !n._migrating && n !== player.node);
         node = this.migrationStrategyFn(player, availableNodes);
       }
 
@@ -259,7 +259,7 @@ class Riffy extends EventEmitter {
       }
 
       const availableNodes = [...this.nodeMap.values()]
-        .filter(n => n.connected && !n._migrating && n !== nodeToMigrate)
+        .filter(n => n.connected && n._ready && !n._migrating && n !== nodeToMigrate)
         .sort((a, b) => a.penalties - b.penalties);
 
       if (!availableNodes.length) {
