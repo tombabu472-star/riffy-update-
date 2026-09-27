@@ -730,15 +730,20 @@ class Node {
     }
 
     if (payload.op === "ready") {
+      // Re-check socket identity after the raw/debug event emissions above —
+      // a listener could have replaced or destroyed the node during either.
+      if (this._destroyed || (socket && this.ws !== socket)) return;
+
       if (this.sessionId !== payload.sessionId) {
         this.rest.setSessionId(payload.sessionId);
         this.sessionId = payload.sessionId;
       }
-      // Mark the node as ready — it now has a valid session ID and is
-      // selectable by leastUsedNodes/bestNode for player creation.
       this._ready = true;
 
       this.riffy.emit("nodeConnect", this);
+
+      // Re-check after nodeConnect — a listener could destroy the node.
+      if (this._destroyed || (socket && this.ws !== socket)) return;
 
       this.riffy.emit("debug", `[Node: ${this.name}] Ready (Ready Payload received)! Session ID: ${payload.sessionId}, ${this.info?.isNodelink ? `Nodelink ✨ (V${this.info?.version?.semver})` : ""}`);
 
@@ -758,16 +763,6 @@ class Node {
         }
       }
 
-      // Auto-resume AFTER the ready packet updates sessionId — not in open().
-      // Previously, open() called restart() before the ready packet arrived,
-      // so REST calls used a stale/null session ID and PATCHed the wrong
-      // Lavalink endpoint. Now restart() runs after sessionId is set.
-      //
-      // IMPORTANT: only restart when the session was NOT resumed. When
-      // payload.resumed is true, Lavalink has already restored the player
-      // state (track, position, paused, volume). Calling restart() would
-      // re-send the cached track/position, potentially rewinding playback
-      // to a stale position and reapplying stale paused/volume state.
       if (this.autoResume && !payload.resumed) {
         for (const player of this.riffy.players.values()) {
           if (player.node === this) {
@@ -785,15 +780,16 @@ class Node {
 
   async close(event, reason, socket, ...args) {
         reason = reason.toString();
-    this.riffy.emit("nodeDisconnect", this, { code: event, reason: reason });
-    this.riffy.emit("debug", `Connection with Lavalink closed with Error code : ${event || "Unknown code"}, reason: ${reason || "Unknown reason"}`);
 
     if (this._destroyed) return;
 
-    // If the socket that emitted this close has been replaced by a newer
-    // reconnect, abort — don't tear down the newer connection's state,
-    // start migration, or call reconnect() against the replacement.
+    // Check socket identity BEFORE emitting lifecycle events — if the
+    // closing socket has been replaced by a newer reconnect, don't emit
+    // nodeDisconnect (false disconnect for a healthy node).
     if (socket && this.ws !== socket) return;
+
+    this.riffy.emit("nodeDisconnect", this, { code: event, reason: reason });
+    this.riffy.emit("debug", `Connection with Lavalink closed with Error code : ${event || "Unknown code"}, reason: ${reason || "Unknown reason"}`);
 
     // Mark the node as unavailable for NEW connections immediately (so
     // leastUsedNodes/bestNode don't select it via _migrating filter), but
