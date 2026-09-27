@@ -141,7 +141,7 @@ class Riffy extends EventEmitter {
    */
   fetchRegion(region) {
     const nodesByRegion = [...this.nodeMap.values()]
-      .filter((node) => node.connected && node.regions?.includes(region?.toLowerCase()))
+      .filter((node) => node.connected && node._ready && !node._migrating && node.regions?.includes(region?.toLowerCase()))
       .sort((a, b) => {
         const aLoad = a.stats.cpu
           ? (a.stats.cpu.systemLoad / a.stats.cpu.cores) * 100

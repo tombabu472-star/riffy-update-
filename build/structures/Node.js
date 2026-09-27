@@ -600,7 +600,10 @@ class Node {
     }
 
     if (this.ws) {
-      // Replacing an existing socket — invalidate the old connection's state.
+      // Remove all listeners from the old socket so late events
+      // (close/message/error) don't fire against the new connection.
+      this.ws.removeAllListeners();
+      this.ws = null;
       this._ready = false;
     }
     this.ws = new Websocket(this.wsUrl, { headers });
@@ -639,11 +642,13 @@ class Node {
 
   async open(socket) {
     // If the socket has been replaced by a newer reconnect, abort.
-    // Also invalidate connected — the stale socket's completion should
-    // not leave the node marked connected while no valid connection exists.
+    // Do NOT mutate connected/_ready — the newer socket owns the state now.
+    // Only clear if this.ws is null (no replacement took over).
     if (this.ws !== socket) {
-      if (this.ws === null) this.connected = false;
-    this._ready = false;
+      if (this.ws === null) {
+        this.connected = false;
+        this._ready = false;
+      }
       return;
     }
 
@@ -667,11 +672,10 @@ class Node {
             })
             .catch((e) => (this.riffy.emit('debug', `[Node: ${this.name}] Failed to fetch info on open: ${e.message}`)));
 
-    // If the socket was replaced during fetchInfo(), invalidate connected
-    // and abort. The newer socket's open() will handle the real setup.
+    // If the socket was replaced during fetchInfo(), abort. Do NOT clear
+    // connected/_ready — the newer socket's open() already set its own state.
+    // Clearing here would wipe the newer connection's valid state.
     if (this.ws !== socket) {
-      this.connected = false;
-    this._ready = false;
       return;
     }
 
@@ -907,7 +911,7 @@ class Node {
     this.riffy.players.forEach((player) => {
       if (player.node == this) {
         const dest = [...this.riffy.nodeMap.values()]
-          .filter(n => n.connected && !n._migrating && n !== this)
+          .filter(n => n.connected && n._ready && !n._migrating && n !== this)
           .sort((a, b) => a.penalties - b.penalties)[0];
         if (dest) {
           movePromises.push(
