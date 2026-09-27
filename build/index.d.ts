@@ -1462,7 +1462,7 @@ export declare class Node {
     public message(msg: any): void;
     public close(event: any, reason: string): Promise<void>;
     public reconnect(): void;
-    public disconnect(): void;
+  public disconnect(): Promise<void>;
     public destroy(clean?: boolean): void;
     readonly penalties: number;
 }

@@ -78,6 +78,8 @@ class Node {
     };
 
     this.connected = false;
+    this._destroyed = false;
+    this._migrating = false;
 
     this.resumeKey = options.resumeKey || null;
     this.resumeTimeout = options.resumeTimeout || 60;
@@ -605,11 +607,15 @@ class Node {
       this.open().catch((err) => {
         this.riffy.emit("debug", `[Node: ${this.name}] open() failed: ${err.message}`);
         this.riffy.emit("nodeError", this, err);
-        // Reset state — don't leave the node marked connected when open() failed
+        // Reset state — don't leave the node marked connected when open() failed.
+        // Check _destroyed first — if the node was destroyed while open() was
+        // awaiting fetchInfo(), don't reconnect a dead node.
         this.connected = false;
         this.ws?.close();
         this.ws = null;
-        this.reconnect();
+        if (!this._destroyed) {
+          this.reconnect();
+        }
       });
     });
     this.ws.on("error", this.error.bind(this));
@@ -723,13 +729,14 @@ class Node {
     this.riffy.emit("nodeDisconnect", this, { code: event, reason: reason });
     this.riffy.emit("debug", `Connection with Lavalink closed with Error code : ${event || "Unknown code"}, reason: ${reason || "Unknown reason"}`);
 
-    // Defer setting connected=false until AFTER migration completes.
-    // Player.moveTo() uses oldNode.rest.destroyPlayer() to clean up the old
-    // Lavalink player — but only when it considers the old node "connected"
-    // enough to have a valid REST endpoint. More importantly, moveTo() now
-    // ALWAYS attempts deletion with .catch(), so this ordering is less
-    // critical, but keeping connected=true during migration ensures
-    // leastUsedNodes/bestNode don't select this node mid-migration.
+    if (this._destroyed) return;
+
+    // Mark the node as unavailable for NEW connections immediately (so
+    // leastUsedNodes/bestNode don't select it), but keep connected=true
+    // so Player.moveTo() can still use oldNode.rest to delete old players.
+    // The _migrating flag prevents destroy() from removing players while
+    // migration is in-flight.
+    this._migrating = true;
     if (this.riffy.migrateOnDisconnect) {
       try {
         await this.riffy.migrate(this);
@@ -737,9 +744,12 @@ class Node {
         this.riffy.emit("debug", `Failed to auto-migrate players from node ${this.name} on disconnect: ${err.message}`);
       }
     }
+    this._migrating = false;
     // NOW safe to mark as disconnected — migration is complete.
     this.connected = false;
-    this.reconnect();
+    if (!this._destroyed) {
+      this.reconnect();
+    }
   }
 
   reconnect() {
@@ -783,46 +793,37 @@ class Node {
    *                                  - Setting the connected state to false.
    */
   destroy(clean = false) {
+    this._destroyed = true;
+
     if (clean) {
-      // Even on terminal/clean destroy, clean up associated players —
-      // close()/disconnect() may have failed to migrate them, leaving
-      // orphaned players in riffy.players pointing at this node.
-      // Use skipRest=true because this branch is reached after reconnect
-      // attempts are exhausted — Lavalink is likely unreachable, so a
-      // REST DELETE would produce an unhandled rejection.
+      // Terminal destroy after reconnect exhaustion. Player.destroy() now
+      // catches REST DELETE failures, so we always attempt the DELETE
+      // (best-effort) instead of skipRest=true which left orphaned Lavalink
+      // players behind.
       this.riffy.players.forEach((player) => {
         if (player.node !== this) return;
 
-        player.destroy(true); // skipRest=true: Lavalink may be unreachable
+        player.destroy(false); // try REST Delete — .catch() handles failure
         this.riffy.emit("playerDestroy", player);
       });
       if (this.ws) this.ws?.close(1000, "Clean Destroy");
       this.ws?.removeAllListeners();
       this.ws = null;
+      clearTimeout(this.reconnectAttempt);
       this.reconnectAttempt = null;
       this.riffy.emit("nodeDestroy", this);
       this.riffy.nodeMap.delete(this.name);
+      this.connected = false;
       return;
     }
 
     // Always clean up associated players — even when already disconnected.
-    // If disconnect() ran, it tried to migrate players; but if migration
-    // failed or no destination was available, players can still be attached
-    // to this node. Without this cleanup, destroyNode() after disconnect()
-    // would leave orphaned players in riffy.players with no node.
-    // Use skipRest=true when already disconnected — the WebSocket is closed,
-    // so a REST DELETE would produce an unhandled rejection.
-    const wasConnected = this.connected;
+    // Player.destroy() now catches REST DELETE failures, so we always use
+    // the normal path (no skipRest) and let .catch() handle unreachable nodes.
     this.riffy.players.forEach((player) => {
       if (player.node !== this) return;
 
-      if (wasConnected) {
-        this.riffy.destroyPlayer(player.guildId);
-      } else {
-        // Already disconnected — skip the REST DELETE (Lavalink is unreachable)
-        player.destroy(true);
-        this.riffy.emit("playerDestroy", player);
-      }
+      this.riffy.destroyPlayer(player.guildId);
     });
 
     this.ws?.close(1000, "destroy");
