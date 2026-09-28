@@ -656,6 +656,31 @@ class Node {
     // Capture the socket so close() can verify it hasn't been replaced by
     // a newer reconnect before mutating lifecycle state.
     this.ws.on("close", (event, reason) => {
+      // GUARD 1 — stale socket: if this.ws has been replaced by a newer
+      // reconnect, the closing socket is no longer current. Don't touch
+      // _closePromise or start migration — the newer socket owns the
+      // lifecycle now. Without this check, a queued close event from the
+      // old socket would overwrite _closePromise (tracking an in-flight
+      // disconnect() or previous close) with a promise that resolves
+      // immediately (close() returns early for stale sockets), then clear
+      // it in finally — leaving destroy() unable to await the real
+      // in-flight migration, which can then PATCH the destination after
+      // local players are removed (orphaned Lavalink players).
+      if (this.ws !== socket) return;
+
+      // GUARD 2 — already destroyed: no cleanup needed.
+      if (this._destroyed) return;
+
+      // GUARD 3 — serialize against an in-flight operation: if disconnect()
+      // (or a previous close()) is already migrating players, its promise
+      // is already registered in _closePromise. Don't overwrite it — that
+      // operation owns the migration and will emit nodeDisconnect / close
+      // the socket / call reconnect() when it completes. destroy() will
+      // await THAT promise. Starting a second migration here would race
+      // with the first and could PATCH the destination for already-moved
+      // players.
+      if (this._closePromise) return;
+
       // Register _closePromise BEFORE invoking close().
       //
       // close() emits nodeDisconnect synchronously (before its first
@@ -674,8 +699,6 @@ class Node {
       //
       // Using a deferred promise lets us register it synchronously
       // first, then kick off close() which resolves/rejects it.
-      // (close() is only called from this handler, so there's no
-      // risk of double-registration from another caller.)
       let resolveClose, rejectClose;
       const promise = new Promise((res, rej) => { resolveClose = res; rejectClose = rej; });
       this._closePromise = promise;
@@ -684,9 +707,8 @@ class Node {
         .then(resolveClose, rejectClose)
         .finally(() => {
           // Only clear if still ours — a newer close/disconnect may
-          // have replaced it (defensive; the guard above normally
-          // prevents this since a second close returns the existing
-          // promise, but disconnect() could also have set it).
+          // have replaced it (shouldn't happen due to GUARD 3 above,
+          // but defensive).
           if (this._closePromise === promise) {
             this._closePromise = null;
           }
