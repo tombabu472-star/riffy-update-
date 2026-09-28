@@ -656,15 +656,22 @@ class Node {
     // Capture the socket so close() can verify it hasn't been replaced by
     // a newer reconnect before mutating lifecycle state.
     this.ws.on("close", (event, reason) => {
-      // Pre-register the operation BEFORE calling close() — if a
-      // nodeDisconnect listener calls destroyNode() synchronously,
-      // destroy() must see _closePromise to await it.
-      this._closePromise = this.close(event, reason, socket);
-      // If close() returned undefined (stale socket / destroyed), clear
-      // the stale value so it doesn't block future disconnect() calls.
-      if (this._closePromise === undefined) {
-        this._closePromise = null;
-      }
+      // Create the close promise and register it BEFORE close() runs —
+      // close() emits nodeDisconnect synchronously, and a listener may
+      // call destroyNode() immediately. destroy() must see _closePromise
+      // to await the in-flight migration.
+      // Use a local + wrapper so the finally can clear _closePromise
+      // without the return value being stale.
+      const promise = (async () => {
+        try {
+          await this.close(event, reason, socket);
+        } finally {
+          if (this._closePromise === promise) {
+            this._closePromise = null;
+          }
+        }
+      })();
+      this._closePromise = promise;
     });
   }
 
@@ -834,10 +841,9 @@ class Node {
         }
       }
     } finally {
-      // Always clear _closePromise in a finally tied to this operation —
-      // NOT inside the async body where the caller can overwrite it after.
+      // _closePromise is cleared by the wrapper in the close handler —
+      // NOT here, to avoid racing with the wrapper's finally.
       this._migrating = false;
-      this._closePromise = null;
       this.connected = false;
       this._ready = false;
       if (!this._destroyed) {
@@ -957,17 +963,25 @@ class Node {
     // the same operation.
     if (this._closePromise) return this._closePromise;
 
-    // Pre-register and clear in finally so the promise is always cleaned up
-    // even on early return — the caller (disconnect) can't overwrite it
-    // because we use finally, not inline cleanup.
-    this._closePromise = (async () => {
+    // Use a local variable so the finally clearing this._closePromise
+    // doesn't race with the return statement. The promise is stored in
+    // _closePromise synchronously (before any await), and cleared in
+    // finally after _doDisconnect completes. Subsequent disconnect()
+    // calls see null and can proceed.
+    const promise = (async () => {
       try {
         await this._doDisconnect();
       } finally {
-        this._closePromise = null;
+        // Only clear if this is still our promise — a newer operation
+        // may have replaced it (shouldn't happen due to the guard above,
+        // but defensive).
+        if (this._closePromise === promise) {
+          this._closePromise = null;
+        }
       }
     })();
-    return this._closePromise;
+    this._closePromise = promise;
+    return promise;
   }
 
   async _doDisconnect() {
