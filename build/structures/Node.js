@@ -951,8 +951,14 @@ class Node {
   }
 
   async _doDisconnect() {
-    if (!this.connected) return;
-    if (this._destroyed) return;
+    // Always clear _closePromise on exit — if we return early (not connected
+    // or destroyed), the promise is cached forever, blocking future
+    // disconnect()/close() calls and making destroy() await a resolved
+    // but non-null promise indefinitely.
+    const cleanup = () => { this._closePromise = null; };
+
+    if (!this.connected) { cleanup(); return; }
+    if (this._destroyed) { cleanup(); return; }
     this._migrating = true;
     const movePromises = [];
     this.riffy.players.forEach((player) => {
