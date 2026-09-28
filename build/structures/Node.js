@@ -632,7 +632,11 @@ class Node {
         }
       });
     });
-    this.ws.on("error", this.error.bind(this));
+    // Capture socket for error handler — a late error from socket A must
+    // NOT emit nodeError or trigger migration against the healthy socket B.
+    this.ws.on("error", (event) => {
+      this.error(event, socket);
+    });
     // Capture socket for message handler — a late message from socket A
     // (e.g. a ready packet) must NOT overwrite sessionId/_ready or trigger
     // auto-resume when socket B has already replaced it.
@@ -698,8 +702,12 @@ class Node {
     // arrives and sets sessionId.
   }
 
-  error(event) {
+  error(event, socket) {
     if (!event) return;
+    // If the socket that emitted this error has been replaced by a newer
+    // reconnect, ignore it — don't emit nodeError or trigger migration
+    // against the healthy replacement connection.
+    if (socket && this.ws !== socket) return;
     this.riffy.emit("nodeError", this, event);
     this.riffy.emit("debug", `[Node: ${this.name}] Websocket Error: ${event.message || event}`);
     if (this.riffy.migrateOnFailure) {
@@ -746,6 +754,10 @@ class Node {
       if (this._destroyed || (socket && this.ws !== socket)) return;
 
       this.riffy.emit("debug", `[Node: ${this.name}] Ready (Ready Payload received)! Session ID: ${payload.sessionId}, ${this.info?.isNodelink ? `Nodelink ✨ (V${this.info?.version?.semver})` : ""}`);
+
+      // Re-check after the debug emission above — a listener could destroy
+      // the node or replace the socket during that event.
+      if (this._destroyed || (socket && this.ws !== socket)) return;
 
       if (this.restVersion === "v4") {
         if (this.sessionId) {
