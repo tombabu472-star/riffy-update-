@@ -656,22 +656,41 @@ class Node {
     // Capture the socket so close() can verify it hasn't been replaced by
     // a newer reconnect before mutating lifecycle state.
     this.ws.on("close", (event, reason) => {
-      // Create the close promise and register it BEFORE close() runs —
-      // close() emits nodeDisconnect synchronously, and a listener may
-      // call destroyNode() immediately. destroy() must see _closePromise
-      // to await the in-flight migration.
-      // Use a local + wrapper so the finally can clear _closePromise
-      // without the return value being stale.
-      const promise = (async () => {
-        try {
-          await this.close(event, reason, socket);
-        } finally {
+      // Register _closePromise BEFORE invoking close().
+      //
+      // close() emits nodeDisconnect synchronously (before its first
+      // internal await on `this.riffy.migrate(this)`), and a listener
+      // may call riffy.destroyNode() immediately during that emit.
+      // destroy() checks this._closePromise to await the in-flight
+      // migration before removing local players — otherwise the
+      // in-flight moveTo() can PATCH destination players for the
+      // already-removed locals, leaving orphaned Lavalink players.
+      //
+      // An async IIFE would run close() synchronously up to that
+      // first await, which means nodeDisconnect fires BEFORE the
+      // outer `this._closePromise = promise` assignment could run
+      // — leaving _closePromise === null when the listener calls
+      // destroyNode().
+      //
+      // Using a deferred promise lets us register it synchronously
+      // first, then kick off close() which resolves/rejects it.
+      // (close() is only called from this handler, so there's no
+      // risk of double-registration from another caller.)
+      let resolveClose, rejectClose;
+      const promise = new Promise((res, rej) => { resolveClose = res; rejectClose = rej; });
+      this._closePromise = promise;
+
+      this.close(event, reason, socket)
+        .then(resolveClose, rejectClose)
+        .finally(() => {
+          // Only clear if still ours — a newer close/disconnect may
+          // have replaced it (defensive; the guard above normally
+          // prevents this since a second close returns the existing
+          // promise, but disconnect() could also have set it).
           if (this._closePromise === promise) {
             this._closePromise = null;
           }
-        }
-      })();
-      this._closePromise = promise;
+        });
     });
   }
 
