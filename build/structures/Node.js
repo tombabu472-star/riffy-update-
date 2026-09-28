@@ -865,14 +865,20 @@ class Node {
     // nodeDisconnect (false disconnect for a healthy node).
     if (socket && this.ws !== socket) return;
 
+    // Mark the node as unavailable for NEW connections BEFORE emitting
+    // nodeDisconnect — a synchronous listener that calls
+    // createConnection() would otherwise select this still-connected,
+    // still-ready node (leastUsedNodes/bestNode/fetchRegion all filter
+    // !node._migrating) and attach a player to the closing socket. That
+    // player would not be included in the migration snapshot (taken
+    // inside riffy.migrate(this) below) and would be orphaned after
+    // cleanup. Keep connected=true so Player.moveTo() can still use
+    // oldNode.rest.destroyPlayer() to delete old players.
+    this._migrating = true;
+
     this.riffy.emit("nodeDisconnect", this, { code: event, reason: reason });
     this.riffy.emit("debug", `Connection with Lavalink closed with Error code : ${event || "Unknown code"}, reason: ${reason || "Unknown reason"}`);
 
-    // Mark the node as unavailable for NEW connections immediately (so
-    // leastUsedNodes/bestNode don't select it via _migrating filter), but
-    // keep connected=true so Player.moveTo() can still use oldNode.rest
-    // to delete old players.
-    this._migrating = true;
     try {
       if (this.riffy.migrateOnDisconnect) {
         try {
