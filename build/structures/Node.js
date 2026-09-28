@@ -604,7 +604,16 @@ class Node {
       // (close/message/error) don't fire against the new connection.
       this.ws.removeAllListeners();
       this.ws = null;
+      // Invalidate connection state — the old socket is gone. The new socket
+      // will re-establish connected/_ready/sessionId through its own open()
+      // and ready path. Without this, the node reports connected===true
+      // with a stale sessionId until the new socket reaches ready, and
+      // callers like lyrics.checkAvailable() issue REST requests against
+      // the old (now invalid) session.
+      this.connected = false;
       this._ready = false;
+      this.sessionId = null;
+      this.rest.sessionId = null;
     }
     this.ws = new Websocket(this.wsUrl, { headers });
     // been replaced by a newer reconnect. If WebSocket A is awaiting
