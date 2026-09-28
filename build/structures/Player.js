@@ -819,10 +819,12 @@ class Player extends EventEmitter {
                 return this;
             }
 
-            // Re-check that this player is still registered — destroyNode()
-            // may have removed it while we were awaiting connection.resolve().
-            if (!this.riffy.players.has(this.guildId)) {
-                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed during voice resolve, aborting.`);
+            // Re-check that this player is still registered AND the node is
+            // not destroyed — destroyNode() may have removed the player
+            // while we were awaiting connection.resolve(). Also check the
+            // node's _destroyed flag to prevent PATCHing a dead session.
+            if (!this.riffy.players.has(this.guildId) || (this.node && this.node._destroyed)) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed or node destroyed during voice resolve, aborting.`);
                 return this;
             }
 
@@ -848,9 +850,9 @@ class Player extends EventEmitter {
             });
 
             // Re-check again after the REST update — destroyNode() may have
-            // run while updatePlayer was in flight.
-            if (!this.riffy.players.has(this.guildId)) {
-                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed during REST update, not emitting playerResumed.`);
+            // run while updatePlayer was in flight. Check node._destroyed too.
+            if (!this.riffy.players.has(this.guildId) || (this.node && this.node._destroyed)) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player or node was destroyed during REST update, not emitting playerResumed.`);
                 return this;
             }
 

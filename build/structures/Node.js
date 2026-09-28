@@ -656,7 +656,14 @@ class Node {
     // Capture the socket so close() can verify it hasn't been replaced by
     // a newer reconnect before mutating lifecycle state.
     this.ws.on("close", (event, reason) => {
-      this._closePromise = this.close(event, reason, socket);
+      // Only store _closePromise if close() will actually process this
+      // event (current socket). A stale socket's close returns undefined
+      // (early exit) — storing that as _closePromise would block future
+      // disconnect() calls with a resolved-but-truthy promise.
+      const promise = this.close(event, reason, socket);
+      if (promise !== undefined) {
+        this._closePromise = promise;
+      }
     });
   }
 
