@@ -834,13 +834,21 @@ class Node {
         const error = new Error(`Unable to connect with ${this.name} node after ${this.reconnectTries} attempts.`);
 
         this.riffy.emit("nodeError", this, error);
+        // Check _destroyed after nodeError — a listener may have destroyed it.
+        if (this._destroyed) return;
         // Clean destroy
         return this.destroy(true);
       }
 
+      // Check _destroyed before reconnecting.
+      if (this._destroyed) return;
+
       this.ws?.removeAllListeners();
       this.ws = null;
       this.riffy.emit("nodeReconnect", this);
+      // Re-check _destroyed after nodeReconnect — a listener may have
+      // destroyed the node during that synchronous event.
+      if (this._destroyed) return;
       this.riffy.emit("debug", `[Node: ${this.name}] Reconnecting... Attempt ${this.reconnectAttempted}/${this.reconnectTries}`);
       this.reconnectAttempt = null;
       this.connect();
@@ -923,14 +931,19 @@ class Node {
   }
 
   disconnect() {
-    // Store the promise so destroy() can await it — without this, calling
-    // disconnect() then destroyNode() would not serialize.
+    // If close()-triggered migration is already in-flight, don't start a
+    // second migration — return the existing promise so callers can await
+    // the same operation. This prevents concurrent migrations from racing
+    // and overwriting each other's _closePromise.
+    if (this._closePromise) return this._closePromise;
+
     this._closePromise = this._doDisconnect();
     return this._closePromise;
   }
 
   async _doDisconnect() {
     if (!this.connected) return;
+    if (this._destroyed) return;
     this._migrating = true;
     const movePromises = [];
     this.riffy.players.forEach((player) => {
