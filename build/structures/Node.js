@@ -656,13 +656,14 @@ class Node {
     // Capture the socket so close() can verify it hasn't been replaced by
     // a newer reconnect before mutating lifecycle state.
     this.ws.on("close", (event, reason) => {
-      // Only store _closePromise if close() will actually process this
-      // event (current socket). A stale socket's close returns undefined
-      // (early exit) — storing that as _closePromise would block future
-      // disconnect() calls with a resolved-but-truthy promise.
-      const promise = this.close(event, reason, socket);
-      if (promise !== undefined) {
-        this._closePromise = promise;
+      // Pre-register the operation BEFORE calling close() — if a
+      // nodeDisconnect listener calls destroyNode() synchronously,
+      // destroy() must see _closePromise to await it.
+      this._closePromise = this.close(event, reason, socket);
+      // If close() returned undefined (stale socket / destroyed), clear
+      // the stale value so it doesn't block future disconnect() calls.
+      if (this._closePromise === undefined) {
+        this._closePromise = null;
       }
     });
   }
@@ -824,20 +825,24 @@ class Node {
     // keep connected=true so Player.moveTo() can still use oldNode.rest
     // to delete old players.
     this._migrating = true;
-    if (this.riffy.migrateOnDisconnect) {
-      try {
-        await this.riffy.migrate(this);
-      } catch (err) {
-        this.riffy.emit("debug", `Failed to auto-migrate players from node ${this.name} on disconnect: ${err.message}`);
+    try {
+      if (this.riffy.migrateOnDisconnect) {
+        try {
+          await this.riffy.migrate(this);
+        } catch (err) {
+          this.riffy.emit("debug", `Failed to auto-migrate players from node ${this.name} on disconnect: ${err.message}`);
+        }
       }
-    }
-    this._migrating = false;
-    this._closePromise = null;
-    // NOW safe to mark as disconnected — migration is complete.
-    this.connected = false;
-    this._ready = false;
-    if (!this._destroyed) {
-      this.reconnect();
+    } finally {
+      // Always clear _closePromise in a finally tied to this operation —
+      // NOT inside the async body where the caller can overwrite it after.
+      this._migrating = false;
+      this._closePromise = null;
+      this.connected = false;
+      this._ready = false;
+      if (!this._destroyed) {
+        this.reconnect();
+      }
     }
   }
 
@@ -949,23 +954,25 @@ class Node {
   disconnect() {
     // If close()-triggered migration is already in-flight, don't start a
     // second migration — return the existing promise so callers can await
-    // the same operation. This prevents concurrent migrations from racing
-    // and overwriting each other's _closePromise.
+    // the same operation.
     if (this._closePromise) return this._closePromise;
 
-    this._closePromise = this._doDisconnect();
+    // Pre-register and clear in finally so the promise is always cleaned up
+    // even on early return — the caller (disconnect) can't overwrite it
+    // because we use finally, not inline cleanup.
+    this._closePromise = (async () => {
+      try {
+        await this._doDisconnect();
+      } finally {
+        this._closePromise = null;
+      }
+    })();
     return this._closePromise;
   }
 
   async _doDisconnect() {
-    // Always clear _closePromise on exit — if we return early (not connected
-    // or destroyed), the promise is cached forever, blocking future
-    // disconnect()/close() calls and making destroy() await a resolved
-    // but non-null promise indefinitely.
-    const cleanup = () => { this._closePromise = null; };
-
-    if (!this.connected) { cleanup(); return; }
-    if (this._destroyed) { cleanup(); return; }
+    if (!this.connected) return;
+    if (this._destroyed) return;
     this._migrating = true;
     const movePromises = [];
     this.riffy.players.forEach((player) => {
@@ -984,7 +991,6 @@ class Node {
     });
     await Promise.allSettled(movePromises);
     this._migrating = false;
-    this._closePromise = null;
     this.ws?.close(1000, "destroy");
     this.ws?.removeAllListeners();
     this.ws = null;
