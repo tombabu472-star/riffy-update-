@@ -819,20 +819,20 @@ class Player extends EventEmitter {
                 return this;
             }
 
+            // Re-check that this player is still registered — destroyNode()
+            // may have removed it while we were awaiting connection.resolve().
+            if (!this.riffy.players.has(this.guildId)) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed during voice resolve, aborting.`);
+                return this;
+            }
+
             const encoded = this.current.track || this.current.encoded;
-            // After a Lavalink WS reconnect, the new server connection has no
-            // player voice state — Connection.resolve() may return immediately
-            // from cached credentials, and checkAndSend() may skip the update
-            // because the cached creds match the last sent values. So we MUST
-            // include the current voice credentials in the restart updatePlayer
-            // to force the new Lavalink server to bind the voice session.
             const restartData = {
                 track: { encoded },
                 position: this.position || 0,
                 volume: this.volume,
                 paused: this.paused,
             };
-            // Include voice credentials so Lavalink re-binds the voice session.
             const conn = this.connection;
             if (conn && conn.voice && conn.voice.sessionId && conn.voice.endpoint && conn.voice.token) {
                 restartData.voice = {
@@ -847,21 +847,23 @@ class Player extends EventEmitter {
                 data: restartData,
             });
 
+            // Re-check again after the REST update — destroyNode() may have
+            // run while updatePlayer was in flight.
+            if (!this.riffy.players.has(this.guildId)) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed during REST update, not emitting playerResumed.`);
+                return this;
+            }
+
             this.riffy.emit("debug", `[Player ${this.guildId}] restart(): resumed "${this.current.info?.title || "Unknown"}" at ${this.position || 0}ms (paused=${this.paused}).`);
             this.riffy.emit("playerResumed", this);
         } else if (!this.current && this.queue.length > 0) {
-            // Only start from the queue if there is genuinely NO current track.
-            // stop() sets playing=false and paused=false but intentionally
-            // leaves current + queue intact. Without the !this.current guard,
-            // a reconnect after stop() would start the next queued track
-            // despite the user having deliberately stopped playback.
             this.riffy.emit("debug", `[Player ${this.guildId}] restart(): no current track, starting next from queue.`);
             try {
-                // After a Lavalink WS reconnect, the new session has no
-                // voice binding. Connection.resolve() may return immediately
-                // from cached creds. Force-send voice credentials to the new
-                // session BEFORE play() — otherwise Lavalink accepts the
-                // track but produces no audio.
+                // Re-check before queue path too.
+                if (!this.riffy.players.has(this.guildId)) {
+                    this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed, aborting queue restart.`);
+                    return this;
+                }
                 const conn = this.connection;
                 if (conn && conn.voice && conn.voice.sessionId && conn.voice.endpoint && conn.voice.token) {
                     await this.node.rest.updatePlayer({
@@ -876,8 +878,13 @@ class Player extends EventEmitter {
                         },
                     });
                 }
+                // Re-check after voice PATCH.
+                if (!this.riffy.players.has(this.guildId)) {
+                    this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed during voice PATCH, aborting.`);
+                    return this;
+                }
                 await this.play();
-                if (this.playing) {
+                if (this.playing && this.riffy.players.has(this.guildId)) {
                     this.riffy.emit("playerResumed", this);
                 }
             } catch (e) {
