@@ -800,6 +800,13 @@ class Player extends EventEmitter {
             return this;
         }
 
+        // Capture the node and session at restart start. If the node
+        // closes/reconnects or the player migrates while connection.resolve()
+        // is pending, this.node may point at a different node or a stale
+        // session. We re-check against these captured values before PATCHing.
+        const startNode = this.node;
+        const startSessionId = startNode?.rest?.sessionId;
+
         this.connect({
             guildId: this.guildId,
             voiceChannel: this.voiceChannel,
@@ -823,8 +830,20 @@ class Player extends EventEmitter {
             // not destroyed — destroyNode() may have removed the player
             // while we were awaiting connection.resolve(). Also check the
             // node's _destroyed flag to prevent PATCHing a dead session.
+            // Additionally, verify the node hasn't changed (player migrated)
+            // and is still _ready with the same session — if the node
+            // closed/reconnected during resolve(), the session could be
+            // null or belong to a different Lavalink session.
             if (!this.riffy.players.has(this.guildId) || (this.node && this.node._destroyed)) {
                 this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed or node destroyed during voice resolve, aborting.`);
+                return this;
+            }
+            if (this.node !== startNode) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player migrated to a different node during voice resolve, aborting (migration handles the move).`);
+                return this;
+            }
+            if (!this.node._ready || !this.node.rest.sessionId || this.node.rest.sessionId !== startSessionId) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): node session changed during voice resolve (ready=${this.node._ready}, session=${this.node.rest.sessionId}), aborting PATCH to avoid stale session.`);
                 return this;
             }
 
@@ -851,8 +870,14 @@ class Player extends EventEmitter {
 
             // Re-check again after the REST update — destroyNode() may have
             // run while updatePlayer was in flight. Check node._destroyed too.
+            // Also re-check node identity and session in case the node
+            // reconnected or the player migrated during the PATCH.
             if (!this.riffy.players.has(this.guildId) || (this.node && this.node._destroyed)) {
                 this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player or node was destroyed during REST update, not emitting playerResumed.`);
+                return this;
+            }
+            if (this.node !== startNode || !this.node._ready || this.node.rest.sessionId !== startSessionId) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): node/session changed during REST update, not emitting playerResumed.`);
                 return this;
             }
 
@@ -864,6 +889,11 @@ class Player extends EventEmitter {
                 // Re-check before queue path too.
                 if (!this.riffy.players.has(this.guildId)) {
                     this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed, aborting queue restart.`);
+                    return this;
+                }
+                // Verify node/session still valid before PATCHing.
+                if (this.node !== startNode || !this.node._ready || this.node.rest.sessionId !== startSessionId) {
+                    this.riffy.emit("debug", `[Player ${this.guildId}] restart(): node/session changed before queue voice PATCH, aborting.`);
                     return this;
                 }
                 const conn = this.connection;
@@ -883,6 +913,10 @@ class Player extends EventEmitter {
                 // Re-check after voice PATCH.
                 if (!this.riffy.players.has(this.guildId)) {
                     this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed during voice PATCH, aborting.`);
+                    return this;
+                }
+                if (this.node !== startNode || !this.node._ready || this.node.rest.sessionId !== startSessionId) {
+                    this.riffy.emit("debug", `[Player ${this.guildId}] restart(): node/session changed during voice PATCH, aborting.`);
                     return this;
                 }
                 await this.play();

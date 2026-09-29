@@ -879,6 +879,25 @@ class Node {
     this.riffy.emit("nodeDisconnect", this, { code: event, reason: reason });
     this.riffy.emit("debug", `Connection with Lavalink closed with Error code : ${event || "Unknown code"}, reason: ${reason || "Unknown reason"}`);
 
+    // Re-check lifecycle identity AFTER the synchronous nodeDisconnect
+    // emit. A listener can call connect() (replacing this.ws with a new
+    // socket) or destroyNode() (setting _destroyed=true) during that
+    // event. If so, abort this close operation — the new socket owns
+    // the lifecycle now. Without this check, the close continuation
+    // would migrate players (interfering with the new connection's
+    // state), set connected/_ready=false (tearing down the replacement),
+    // and schedule a duplicate reconnect.
+    if (this._destroyed || (socket && this.ws !== socket)) {
+      // The new socket (or a destroyed node) owns the state now. Don't
+      // touch _migrating/connected/_ready — the new socket's open()/
+      // ready path will set them. Just clear _migrating if the socket
+      // changed (the new socket isn't migrating yet).
+      if (socket && this.ws !== socket) {
+        this._migrating = false;
+      }
+      return;
+    }
+
     try {
       if (this.riffy.migrateOnDisconnect) {
         try {
@@ -888,6 +907,15 @@ class Node {
         }
       }
     } finally {
+      // Re-check again after the async migration — a listener inside
+      // migrate() (playerMigrated, nodeMigrated, etc.) or a concurrent
+      // operation could have replaced the socket or destroyed the node.
+      if (this._destroyed || (socket && this.ws !== socket)) {
+        if (socket && this.ws !== socket) {
+          this._migrating = false;
+        }
+        return;
+      }
       // _closePromise is cleared by the wrapper in the close handler —
       // NOT here, to avoid racing with the wrapper's finally.
       this._migrating = false;
