@@ -874,10 +874,32 @@ class Player extends EventEmitter {
             // reconnected or the player migrated during the PATCH.
             if (!this.riffy.players.has(this.guildId) || (this.node && this.node._destroyed)) {
                 this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player or node was destroyed during REST update, not emitting playerResumed.`);
+                // Best-effort remote cleanup: the PATCH above may have created
+                // or updated the Lavalink player. Since the local player is now
+                // destroyed (Player.destroy() removed it), the remote player
+                // would be orphaned with no local owner. Player.destroy() already
+                // sent a DELETE, but that DELETE may have completed BEFORE this
+                // PATCH (the PATCH recreated the orphan). Send another DELETE
+                // using the captured session to ensure the last REST op is a
+                // DELETE. The node being destroyed doesn't mean the REST endpoint
+                // is unreachable — the DELETE is best-effort (.catch() handles
+                // failures). Only check the session matches what we PATCHed.
+                if (startNode && startNode.rest.sessionId === startSessionId) {
+                    startNode.rest.destroyPlayer(this.guildId).catch((e) => {
+                        this.riffy.emit("debug", `[Player ${this.guildId}] restart(): best-effort orphan cleanup DELETE failed: ${e.message}`);
+                    });
+                }
                 return this;
             }
             if (this.node !== startNode || !this.node._ready || this.node.rest.sessionId !== startSessionId) {
                 this.riffy.emit("debug", `[Player ${this.guildId}] restart(): node/session changed during REST update, not emitting playerResumed.`);
+                // Same orphan risk: the PATCH landed on startNode/startSessionId.
+                // Clean it up if that session is still the one we PATCHed.
+                if (startNode && startNode.rest.sessionId === startSessionId) {
+                    startNode.rest.destroyPlayer(this.guildId).catch((e) => {
+                        this.riffy.emit("debug", `[Player ${this.guildId}] restart(): best-effort orphan cleanup DELETE failed (session changed): ${e.message}`);
+                    });
+                }
                 return this;
             }
 
@@ -913,10 +935,22 @@ class Player extends EventEmitter {
                 // Re-check after voice PATCH.
                 if (!this.riffy.players.has(this.guildId)) {
                     this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed during voice PATCH, aborting.`);
+                    // Best-effort orphan cleanup — same reasoning as the main
+                    // restart path above.
+                    if (startNode && startNode.rest.sessionId === startSessionId) {
+                        startNode.rest.destroyPlayer(this.guildId).catch((e) => {
+                            this.riffy.emit("debug", `[Player ${this.guildId}] restart(): best-effort orphan cleanup DELETE failed (queue path): ${e.message}`);
+                        });
+                    }
                     return this;
                 }
                 if (this.node !== startNode || !this.node._ready || this.node.rest.sessionId !== startSessionId) {
                     this.riffy.emit("debug", `[Player ${this.guildId}] restart(): node/session changed during voice PATCH, aborting.`);
+                    if (startNode && startNode.rest.sessionId === startSessionId) {
+                        startNode.rest.destroyPlayer(this.guildId).catch((e) => {
+                            this.riffy.emit("debug", `[Player ${this.guildId}] restart(): best-effort orphan cleanup DELETE failed (queue session changed): ${e.message}`);
+                        });
+                    }
                     return this;
                 }
                 await this.play();
