@@ -387,9 +387,15 @@ class Player extends EventEmitter {
         this.playing = false;
         this.paused = false;
         this._playingBeforePause = false;
+        // Fire-and-forget: attach .catch() so a non-2xx REST response
+        // (e.g. 4xx/5xx from Lavalink) doesn't become an unhandled
+        // rejection that terminates Node.js under
+        // --unhandled-rejections=throw. Preserves the synchronous API.
         this.node.rest.updatePlayer({
             guildId: this.guildId,
             data: { track: { encoded: null } },
+        }).catch((e) => {
+            this.riffy.emit("debug", `[Player ${this.guildId}] stop() REST update failed: ${e.message}`);
         });
 
         return this;
@@ -401,9 +407,12 @@ class Player extends EventEmitter {
      * @returns {Promise<this>}
      */
     async pause(toggle = true) {
+        // Fire-and-forget: attach .catch() — see stop() for rationale.
         this.node.rest.updatePlayer({
             guildId: this.guildId,
             data: { paused: toggle },
+        }).catch((e) => {
+            this.riffy.emit("debug", `[Player ${this.guildId}] pause() REST update failed: ${e.message}`);
         });
 
         const wasPaused = this.paused;
@@ -435,7 +444,11 @@ class Player extends EventEmitter {
         const clampedPosition = Math.max(0, Math.min(trackLength, position));
         this.position = clampedPosition;
 
-        this.node.rest.updatePlayer({ guildId: this.guildId, data: { position: clampedPosition } });
+        // Fire-and-forget: attach .catch() — see stop() for rationale.
+        this.node.rest.updatePlayer({ guildId: this.guildId, data: { position: clampedPosition } })
+            .catch((e) => {
+                this.riffy.emit("debug", `[Player ${this.guildId}] seek() REST update failed: ${e.message}`);
+            });
     }
 
     /**
@@ -448,7 +461,11 @@ class Player extends EventEmitter {
             throw new Error("[Volume] Volume must be between 0 to 1000");
         }
 
-        this.node.rest.updatePlayer({ guildId: this.guildId, data: { volume } });
+        // Fire-and-forget: attach .catch() — see stop() for rationale.
+        this.node.rest.updatePlayer({ guildId: this.guildId, data: { volume } })
+            .catch((e) => {
+                this.riffy.emit("debug", `[Player ${this.guildId}] setVolume() REST update failed: ${e.message}`);
+            });
         this.volume = volume;
         this._initialVolumePendingSync = false;
         return this;
