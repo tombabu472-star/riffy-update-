@@ -817,6 +817,18 @@ class Player extends EventEmitter {
             return this;
         }
 
+        // Verify this player is still the registered instance for this guild.
+        // If the player was destroyed and a new player was created for the
+        // same guildId, this check fails (identity, not just key presence).
+        // Without this, the old restart could act on the replaced player's
+        // behalf — PATCHing the old node/session, overwriting the
+        // replacement's remote player, and emitting playerResumed for the
+        // destroyed instance.
+        if (this.riffy.players.get(this.guildId) !== this) {
+            this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was replaced (different instance registered), aborting.`);
+            return this;
+        }
+
         // Capture the node and session at restart start. If the node
         // closes/reconnects or the player migrates while connection.resolve()
         // is pending, this.node may point at a different node or a stale
@@ -851,8 +863,12 @@ class Player extends EventEmitter {
             // and is still _ready with the same session — if the node
             // closed/reconnected during resolve(), the session could be
             // null or belong to a different Lavalink session.
-            if (!this.riffy.players.has(this.guildId) || (this.node && this.node._destroyed)) {
-                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed or node destroyed during voice resolve, aborting.`);
+            // Identity check: this.riffy.players.get(this.guildId) === this
+            // (not just .has()) ensures that if the player was destroyed and
+            // a NEW player was created for the same guildId, this old restart
+            // aborts instead of acting on the replacement's behalf.
+            if (this.riffy.players.get(this.guildId) !== this || (this.node && this.node._destroyed)) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed/replaced or node destroyed during voice resolve, aborting.`);
                 return this;
             }
             if (this.node !== startNode) {
@@ -889,8 +905,8 @@ class Player extends EventEmitter {
             // run while updatePlayer was in flight. Check node._destroyed too.
             // Also re-check node identity and session in case the node
             // reconnected or the player migrated during the PATCH.
-            if (!this.riffy.players.has(this.guildId) || (this.node && this.node._destroyed)) {
-                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player or node was destroyed during REST update, not emitting playerResumed.`);
+            if (this.riffy.players.get(this.guildId) !== this || (this.node && this.node._destroyed)) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player or node was destroyed/replaced during REST update, not emitting playerResumed.`);
                 // Best-effort remote cleanup: the PATCH above may have created
                 // or updated the Lavalink player. Since the local player is now
                 // destroyed (Player.destroy() removed it), the remote player
@@ -925,9 +941,10 @@ class Player extends EventEmitter {
         } else if (!this.current && this.queue.length > 0) {
             this.riffy.emit("debug", `[Player ${this.guildId}] restart(): no current track, starting next from queue.`);
             try {
-                // Re-check before queue path too.
-                if (!this.riffy.players.has(this.guildId)) {
-                    this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed, aborting queue restart.`);
+                // Re-check before queue path too. Identity check ensures we
+                // abort if the player was destroyed and replaced.
+                if (this.riffy.players.get(this.guildId) !== this) {
+                    this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed/replaced, aborting queue restart.`);
                     return this;
                 }
                 // Verify node/session still valid before PATCHing.
@@ -949,9 +966,9 @@ class Player extends EventEmitter {
                         },
                     });
                 }
-                // Re-check after voice PATCH.
-                if (!this.riffy.players.has(this.guildId)) {
-                    this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed during voice PATCH, aborting.`);
+                // Re-check after voice PATCH. Identity check.
+                if (this.riffy.players.get(this.guildId) !== this) {
+                    this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed/replaced during voice PATCH, aborting.`);
                     // Best-effort orphan cleanup — same reasoning as the main
                     // restart path above.
                     if (startNode && startNode.rest.sessionId === startSessionId) {
@@ -971,7 +988,7 @@ class Player extends EventEmitter {
                     return this;
                 }
                 await this.play();
-                if (this.playing && this.riffy.players.has(this.guildId)) {
+                if (this.playing && this.riffy.players.get(this.guildId) === this) {
                     this.riffy.emit("playerResumed", this);
                 }
             } catch (e) {
