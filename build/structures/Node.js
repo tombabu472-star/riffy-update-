@@ -1088,6 +1088,13 @@ class Node {
   async _doDisconnect() {
     if (!this.connected) return;
     if (this._destroyed) return;
+    // Capture the socket being disconnected. If connect() replaces this.ws
+    // while player migrations are pending (e.g., a user calls connect() to
+    // create a replacement connection), the cleanup below must NOT close the
+    // replacement socket, remove its listeners, or mark the node disconnected.
+    // Without this capture, this.ws?.close() would close the NEW socket after
+    // migrations complete, tearing down the replacement connection.
+    const socket = this.ws;
     this._migrating = true;
     const movePromises = [];
     this.riffy.players.forEach((player) => {
@@ -1105,6 +1112,16 @@ class Node {
       }
     });
     await Promise.allSettled(movePromises);
+
+    // Re-check: if the node was destroyed, or the socket was replaced by
+    // connect() during the migrations, abort the cleanup — the new socket
+    // (or a destroyed node) owns the lifecycle now. Don't close/clear the
+    // replacement's state.
+    if (this._destroyed || this.ws !== socket) {
+      this._migrating = false;
+      return;
+    }
+
     this._migrating = false;
     this.ws?.close(1000, "destroy");
     this.ws?.removeAllListeners();
