@@ -699,8 +699,20 @@ class Node {
       //
       // Using a deferred promise lets us register it synchronously
       // first, then kick off close() which resolves/rejects it.
+      //
+      // Attach a no-op .catch() to the deferred promise itself: if close()
+      // rejects (e.g., a synchronous nodeDisconnect/debug listener throws),
+      // rejectClose is called → the deferred rejects. If nobody is awaiting
+      // _closePromise yet (destroy() hasn't run), Node.js would report an
+      // unhandled rejection — which on --unhandled-rejections=throw
+      // terminates the process during socket cleanup. The .catch() swallows
+      // the rejection until destroy() awaits it (destroy wraps the await in
+      // try/catch). This does NOT lose the error: destroy() still sees the
+      // settled state, and the close-chain's own rejection is handled by
+      // the .catch() at the end of the .finally() chain below.
       let resolveClose, rejectClose;
       const promise = new Promise((res, rej) => { resolveClose = res; rejectClose = rej; });
+      promise.catch(() => {});
       this._closePromise = promise;
 
       this.close(event, reason, socket)
@@ -712,7 +724,12 @@ class Node {
           if (this._closePromise === promise) {
             this._closePromise = null;
           }
-        });
+        })
+        // .finally() returns a NEW Promise. If close() rejected, this
+        // Promise is also rejected and has no handler — swallow it.
+        // The rejection was already delivered to the deferred promise
+        // via rejectClose (and the deferred has its own .catch() above).
+        .catch(() => {});
     });
   }
 
@@ -1043,6 +1060,15 @@ class Node {
     // _closePromise synchronously (before any await), and cleared in
     // finally after _doDisconnect completes. Subsequent disconnect()
     // calls see null and can proceed.
+    //
+    // The .catch(() => {}) at the end swallows any rejection from the
+    // finally chain — the rejection is already delivered to the caller
+    // via the returned promise (callers do `await disconnect()` and
+    // handle errors there). Without this catch, if _doDisconnect()
+    // rejects, the Promise returned by the IIFE's .finally() would also
+    // reject with no handler, producing an unhandled rejection that can
+    // terminate the process on Node.js configs that treat unhandled
+    // rejections as fatal.
     const promise = (async () => {
       try {
         await this._doDisconnect();
@@ -1054,7 +1080,7 @@ class Node {
           this._closePromise = null;
         }
       }
-    })();
+    })().catch(() => {});
     this._closePromise = promise;
     return promise;
   }
