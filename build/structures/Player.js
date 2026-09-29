@@ -848,10 +848,29 @@ class Player extends EventEmitter {
         // while playing=false and paused=false). Without this guard, a reconnect
         // would replay a deliberately stopped or already-finished track.
         if (this.current && (this.current.track || this.current.encoded) && (this.playing || this.paused)) {
+            // Capture the track and playback state BEFORE awaiting
+            // connection.resolve(). If stop() (or a track-error/stuck handler)
+            // runs while resolve() is pending, we re-check these captured
+            // values after the await and abort if playback was stopped or
+            // the track changed — otherwise the continuation would PATCH the
+            // captured track with paused:false and emit playerResumed,
+            // undoing the intentional stop.
+            const startTrackEncoded = this.current.track || this.current.encoded;
+            const startWasActive = this.playing || this.paused;
+
             try {
                 await this.connection.resolve();
             } catch (e) {
                 this.riffy.emit("debug", `[Player ${this.guildId}] restart(): voice credentials not ready, aborting: ${e.message}`);
+                return this;
+            }
+
+            // Re-check that playback is still active and the track hasn't
+            // changed. If stop() was called during resolve(), this.playing
+            // and this.paused are both false — abort to not resurrect.
+            const currentTrackEncoded = this.current ? (this.current.track || this.current.encoded) : null;
+            if (!startWasActive || !(this.playing || this.paused) || currentTrackEncoded !== startTrackEncoded) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): playback was stopped or track changed during voice resolve, aborting to not resurrect.`);
                 return this;
             }
 
