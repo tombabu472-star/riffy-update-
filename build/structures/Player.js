@@ -928,15 +928,20 @@ class Player extends EventEmitter {
                 this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player or node was destroyed/replaced during REST update, not emitting playerResumed.`);
                 // Best-effort remote cleanup: the PATCH above may have created
                 // or updated the Lavalink player on the OLD session
-                // (startSessionId). Send a DELETE directly against that session
-                // — NOT startNode.rest.destroyPlayer() which uses the node's
-                // CURRENT sessionId (which may have changed after a reconnect,
-                // leaving the old-session orphan uncleaned). Using makeRequest
-                // with startSessionId in the URL ensures the orphan is targeted.
-                if (startNode && startSessionId) {
+                // (startSessionId). Send a DELETE directly against that session.
+                // BUT: only delete if NO replacement player exists for this
+                // guild — if a new Player was created on the same session while
+                // the PATCH was in flight, the DELETE would kill the replacement's
+                // active Lavalink player. Check that the map entry is undefined
+                // (truly gone, no replacement), not just "not this instance".
+                const registeredNow = this.riffy.players.get(this.guildId);
+                const hasReplacement = registeredNow !== undefined && registeredNow !== this;
+                if (!hasReplacement && startNode && startSessionId) {
                     startNode.rest.makeRequest("DELETE", `/${startNode.rest.version}/sessions/${startSessionId}/players/${this.guildId}`).catch((e) => {
                         this.riffy.emit("debug", `[Player ${this.guildId}] restart(): best-effort orphan cleanup DELETE failed: ${e.message}`);
                     });
+                } else if (hasReplacement) {
+                    this.riffy.emit("debug", `[Player ${this.guildId}] restart(): skipping orphan cleanup DELETE — replacement player exists on the same session.`);
                 }
                 return this;
             }
@@ -985,12 +990,17 @@ class Player extends EventEmitter {
                 // Re-check after voice PATCH. Identity check.
                 if (this.riffy.players.get(this.guildId) !== this) {
                     this.riffy.emit("debug", `[Player ${this.guildId}] restart(): player was destroyed/replaced during voice PATCH, aborting.`);
-                    // Best-effort orphan cleanup — DELETE against the captured
-                    // old session directly (not the node's current session).
-                    if (startNode && startSessionId) {
+                    // Best-effort orphan cleanup — but only if no replacement
+                    // player exists on the same session. If a replacement was
+                    // created, the DELETE would kill its active Lavalink player.
+                    const registeredNow = this.riffy.players.get(this.guildId);
+                    const hasReplacement = registeredNow !== undefined && registeredNow !== this;
+                    if (!hasReplacement && startNode && startSessionId) {
                         startNode.rest.makeRequest("DELETE", `/${startNode.rest.version}/sessions/${startSessionId}/players/${this.guildId}`).catch((e) => {
                             this.riffy.emit("debug", `[Player ${this.guildId}] restart(): best-effort orphan cleanup DELETE failed (queue path): ${e.message}`);
                         });
+                    } else if (hasReplacement) {
+                        this.riffy.emit("debug", `[Player ${this.guildId}] restart(): skipping orphan cleanup DELETE (queue path) — replacement player exists.`);
                     }
                     return this;
                 }
