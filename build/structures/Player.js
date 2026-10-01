@@ -965,6 +965,28 @@ class Player extends EventEmitter {
                 return this;
             }
 
+            // Re-check playback state and track AFTER the PATCH. If stop()
+            // (or a track-error/stuck handler) ran while updatePlayer was in
+            // flight, this.playing && this.paused are both false (or the track
+            // changed). The PATCH recreated the remote player with the captured
+            // track — suppress playerResumed and perform best-effort cleanup
+            // of the orphaned Lavalink player.
+            const postPatchTrack = this.current ? (this.current.track || this.current.encoded) : null;
+            if (!(this.playing || this.paused) || postPatchTrack !== startTrackEncoded) {
+                this.riffy.emit("debug", `[Player ${this.guildId}] restart(): playback was stopped or track changed during PATCH, suppressing playerResumed and cleaning up.`);
+                if (startNode && startSessionId) {
+                    const regNowPost = this.riffy.players.get(this.guildId);
+                    const replOwnsPost = regNowPost !== undefined && regNowPost !== this
+                        && regNowPost.node === startNode && startNode.rest.sessionId === startSessionId;
+                    if (!replOwnsPost) {
+                        startNode.rest.makeRequest("DELETE", `/${startNode.rest.version}/sessions/${startSessionId}/players/${this.guildId}`).catch((e) => {
+                            this.riffy.emit("debug", `[Player ${this.guildId}] restart(): post-PATCH stop cleanup DELETE failed: ${e.message}`);
+                        });
+                    }
+                }
+                return this;
+            }
+
             this.riffy.emit("debug", `[Player ${this.guildId}] restart(): resumed "${this.current.info?.title || "Unknown"}" at ${this.position || 0}ms (paused=${this.paused}).`);
             this.riffy.emit("playerResumed", this);
         } else if (!this.current && this.queue.length > 0) {
