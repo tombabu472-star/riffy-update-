@@ -580,6 +580,14 @@ class Node {
   // }
 
   async connect() {
+    // Guard: don't reconnect a destroyed node. After destroy() removes the
+    // node from nodeMap and marks _destroyed, a delayed reconnect callback
+    // or retained Node reference could call connect(), opening an unmanaged
+    // connected/ready node that leaks resources and confuses node selection.
+    if (this._destroyed) {
+      this.riffy.emit("debug", `[Node (${this.name})] connect() called but node is already destroyed, aborting.`);
+      return;
+    }
     if (this.ws) this.ws.close()
     // this.riffy.emit("debug", `[Node (${this.name}) - Version Check] Checking Node Version`);
     this.riffy.emit("debug", `[Node (${this.name})] Connecting to the Node (i.e Lavalink/Nodelink Server; Opening a WebSocket Connection)`);
@@ -1055,20 +1063,13 @@ class Node {
     // the same operation.
     if (this._closePromise) return this._closePromise;
 
-    // Use a local variable so the finally clearing this._closePromise
-    // doesn't race with the return statement. The promise is stored in
-    // _closePromise synchronously (before any await), and cleared in
-    // finally after _doDisconnect completes. Subsequent disconnect()
-    // calls see null and can proceed.
-    //
-    // The .catch(() => {}) at the end swallows any rejection from the
-    // finally chain — the rejection is already delivered to the caller
-    // via the returned promise (callers do `await disconnect()` and
-    // handle errors there). Without this catch, if _doDisconnect()
-    // rejects, the Promise returned by the IIFE's .finally() would also
-    // reject with no handler, producing an unhandled rejection that can
-    // terminate the process on Node.js configs that treat unhandled
-    // rejections as fatal.
+    // Store the RAW IIFE promise (pre-.catch) in _closePromise so:
+    // 1. The finally block's identity check (this._closePromise === promise)
+    //    actually matches and clears the field when done.
+    // 2. Callers receive a promise that can reject (so they can handle
+    //    disconnect failures), NOT a swallowed .catch() promise.
+    // Attach a SEPARATE .catch() for unhandled-rejection prevention that
+    // does not affect the stored/returned promise.
     const promise = (async () => {
       try {
         await this._doDisconnect();
@@ -1080,8 +1081,11 @@ class Node {
           this._closePromise = null;
         }
       }
-    })().catch(() => {});
+    })();
     this._closePromise = promise;
+    // Prevent unhandled rejection without swallowing it for callers
+    // (this .catch is on a separate chain, not the stored/returned one).
+    promise.catch(() => {});
     return promise;
   }
 

@@ -1079,22 +1079,27 @@ class Player extends EventEmitter {
 
         const oldNode = this.node;
 
+        // Declare state BEFORE the try block so it's visible in the catch
+        // block for rollback. Previously state was inside try, causing
+        // ReferenceError: state is not defined when catch tried to use
+        // state.voice for rollback — masking the migration error and
+        // skipping rollback entirely.
+        const { player, ...filterData } = this.filters;
+
+        const state = {
+            track: this.current,
+            position: this.position,
+            volume: this.volume,
+            paused: this.paused,
+            filters: filterData,
+            voice: {
+                token: this.connection.voice.token,
+                endpoint: this.connection.voice.endpoint,
+                sessionId: this.connection.voice.sessionId,
+            }
+        };
+
         try {
-            const { player, ...filterData } = this.filters;
-
-            const state = {
-                track: this.current,
-                position: this.position,
-                volume: this.volume,
-                paused: this.paused,
-                filters: filterData,
-                voice: {
-                    token: this.connection.voice.token,
-                    endpoint: this.connection.voice.endpoint,
-                    sessionId: this.connection.voice.sessionId,
-                }
-            };
-
             // Always attempt old player deletion — even when oldNode.connected
             // is false (close()/disconnect() sets it before migrate runs).
             // The old Lavalink REST endpoint may still be reachable even if
